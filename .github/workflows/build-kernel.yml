@@ -51,7 +51,22 @@ jobs:
       - name: Download AOSP clang (cache miss only)
         if: steps.clangcache.outputs.cache-hit != 'true'
         run: |
-          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/531a564ba5426707dee226eccb19f104a7af5a5f/clang-r563880c.tar.gz -O clang.tar.gz
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/531a564ba5426707dee226eccb19f104a7af5a5f/clang-r563880c.tar.gz"
+          ok=
+          for attempt in 1 2 3 4 5; do
+            echo "== download attempt $attempt =="
+            rm -f clang.tar.gz
+            if curl -fL --retry 5 --retry-all-errors --retry-delay 5 \
+                 --connect-timeout 30 --speed-limit 1024 --speed-time 120 \
+                 -o clang.tar.gz "$URL" && gzip -t clang.tar.gz; then
+              ok=1
+              break
+            fi
+            echo "attempt $attempt failed (truncated/corrupt), retrying in 15s"
+            sleep 15
+          done
+          test -n "$ok"
+          gzip -t clang.tar.gz
           mkdir -p clang
           tar -xf clang.tar.gz -C clang
           rm -f clang.tar.gz
