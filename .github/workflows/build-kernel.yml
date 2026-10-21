@@ -46,15 +46,19 @@ jobs:
           # Cache the WHOLE toolchain (clang/): bin/ alone is not enough,
           # clang also needs lib/clang/*/include (stddef.h) and lib/LLVMPolly.so.
           path: clang
-          key: clang-r547379-v2
+          key: clang-r563880c-14054515-v1
 
       - name: Download AOSP clang (cache miss only)
         if: steps.clangcache.outputs.cache-hit != 'true'
         run: |
-          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r547379.tar.gz -O clang.tar.gz
+          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/531a564ba5426707dee226eccb19f104a7af5a5f/clang-r563880c.tar.gz -O clang.tar.gz
           mkdir -p clang
           tar -xf clang.tar.gz -C clang
           rm -f clang.tar.gz
+          grep -Fx '21.0.0' clang/AndroidVersion.txt
+          grep -Fx 'based on r563880c' clang/AndroidVersion.txt
+          clang/bin/clang --version | head -1
+          clang/bin/clang --version | grep -F 'clang version 21.0.0'
           ls clang/bin/clang clang/bin/ld.lld clang/lib/LLVMPolly.so
           ls clang/lib/clang/*/include/stddef.h
 
@@ -64,7 +68,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: clang
-          key: clang-r547379-v2
+          key: clang-r563880c-14054515-v1
 
       - name: Configure kernel
         run: |
