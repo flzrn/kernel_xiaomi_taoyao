@@ -52,7 +52,7 @@ obj-y += dma/
 # driver version to what the legacy branch HEAD maps to
 # (30000 + commit_count + 289) so it lines up with the KernelSU-Next v3.4.2
 # manager (33355).
-KSU_VERSION_OVERRIDE := 33315
+KSU_VERSION_OVERRIDE := 33318
 KSU_VERSION_TAG_OVERRIDE := v3.4.2
 export KSU_VERSION_OVERRIDE KSU_VERSION_TAG_OVERRIDE
 
