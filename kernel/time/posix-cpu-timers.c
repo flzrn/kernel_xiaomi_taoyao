@@ -603,10 +603,8 @@ static void arm_timer(struct k_itimer *timer)
 
 	rcu_read_lock();
 	p = cpu_timer_task_rcu(timer);
-	if (!p) {
-		rcu_read_unlock();
-		return;
-	}
+	if (!p)
+		goto out;
 
 	if (CPUCLOCK_PERTHREAD(timer->it_clock))
 		base = p->posix_cputimers.bases + clkidx;
@@ -614,7 +612,7 @@ static void arm_timer(struct k_itimer *timer)
 		base = p->signal->posix_cputimers.bases + clkidx;
 
 	if (!cpu_timer_enqueue(&base->tqhead, ctmr))
-		return;
+		goto out;
 
 	/*
 	 * We are the new earliest-expiring POSIX 1.b timer, hence
@@ -629,6 +627,8 @@ static void arm_timer(struct k_itimer *timer)
 		tick_dep_set_task(p, TICK_DEP_BIT_POSIX_TIMER);
 	else
 		tick_dep_set_signal(p->signal, TICK_DEP_BIT_POSIX_TIMER);
+out:
+	rcu_read_unlock();
 }
 
 /*
