@@ -1806,37 +1806,72 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 					      struct psy_state *pst,
 					      int fallback_soc)
 {
+	static DEFINE_SPINLOCK(soc_lock);
+	static int last_soc = -1;
+	static u32 cached_charge_full;
 	u32 charge_full, charge_counter;
-	int rc, calibrated_soc;
+	int rc, raw_soc, target_soc;
+	bool is_charging;
+	unsigned long flags;
 
 	if (!bcdev->use_charge_counter_soc_calib)
 		return fallback_soc;
 
-	rc = read_property_id(bcdev, pst, BATT_CHG_FULL);
-	if (rc < 0)
-		return fallback_soc;
+	/* Read or use cached charge_full to avoid redundant GLINK traffic */
+	if (!cached_charge_full) {
+		rc = read_property_id(bcdev, pst, BATT_CHG_FULL);
+		if (rc >= 0 && pst->prop[BATT_CHG_FULL] > 0)
+			cached_charge_full = pst->prop[BATT_CHG_FULL];
+	}
+	charge_full = cached_charge_full ? cached_charge_full : pst->prop[BATT_CHG_FULL];
 
+	/* Read real-time charge_counter */
 	rc = read_property_id(bcdev, pst, BATT_CHG_COUNTER);
-	if (rc < 0)
-		return fallback_soc;
+	if (rc >= 0)
+		charge_counter = pst->prop[BATT_CHG_COUNTER];
+	else
+		charge_counter = 0;
 
-	charge_full = pst->prop[BATT_CHG_FULL];
-	charge_counter = pst->prop[BATT_CHG_COUNTER];
+	/* Calculate raw Coulomb-counter SOC */
+	if (charge_full > 0 && charge_counter > 0 &&
+	    charge_counter <= (charge_full + (charge_full / 20))) {
+		raw_soc = DIV_ROUND_CLOSEST_ULL((u64)charge_counter * 100,
+						charge_full);
+		target_soc = clamp_t(int, raw_soc, 0, 100);
+	} else {
+		target_soc = fallback_soc;
+	}
 
-	if (!charge_full)
-		return fallback_soc;
+	/* Determine if charging or discharging */
+	is_charging = (pst->prop[BATT_STATUS] == POWER_SUPPLY_STATUS_CHARGING ||
+		       pst->prop[BATT_STATUS] == POWER_SUPPLY_STATUS_FULL ||
+		       bcdev->psy_list[PSY_TYPE_USB].prop[USB_ONLINE]);
 
-	if (!charge_counter)
-		return fallback_soc;
+	/* Monotonic step smoother: drop at most 1% per update during discharge */
+	spin_lock_irqsave(&soc_lock, flags);
 
-	/* Ignore obviously bogus values from fuel-gauge telemetry. */
-	if (charge_counter > (charge_full + (charge_full / 20)))
-		return fallback_soc;
+	if (last_soc < 0) {
+		/* First valid read after boot: initialize directly without delay */
+		if (target_soc > 0 || charge_counter > 0)
+			last_soc = target_soc;
+		spin_unlock_irqrestore(&soc_lock, flags);
+		return target_soc;
+	}
 
-	calibrated_soc = DIV_ROUND_CLOSEST_ULL((u64)charge_counter * 100,
-					       charge_full);
+	if (is_charging) {
+		/* When charging: can only stay same or increment by 1 */
+		if (target_soc > last_soc)
+			last_soc++;
+	} else {
+		/* When discharging: can only stay same or decrement by 1 (no erratic 2-5% drops!) */
+		if (target_soc < last_soc)
+			last_soc--;
+	}
 
-	return clamp_t(int, calibrated_soc, 0, 100);
+	target_soc = clamp_t(int, last_soc, 0, 100);
+	spin_unlock_irqrestore(&soc_lock, flags);
+
+	return target_soc;
 }
 
 static int battery_psy_get_prop(struct power_supply *psy,
