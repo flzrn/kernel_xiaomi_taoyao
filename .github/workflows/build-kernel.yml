@@ -16,10 +16,6 @@ on:
       - 'Makefile'
       - '.github/workflows/build-kernel.yml'
 
-concurrency:
-  group: kernel-build-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build:
     runs-on: ubuntu-22.04
