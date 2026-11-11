@@ -26,11 +26,55 @@
 #include "feature/kernel_umount.h"
 #include "compat/kernel_compat.h"
 
+#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs.h>
+#include "selinux/selinux.h"
+extern struct work_struct susfs_extra_works;
+#endif
+
 int ksu_handle_setresuid(uid_t old_uid, uid_t new_uid)
 {
     // we rely on the fact that zygote always call setresuid(3) with same uids
 
     pr_info("handle_setresuid from %d to %d\n", old_uid, new_uid);
+
+#ifdef CONFIG_KSU_SUSFS
+	// We only care about processes spawned by zygote.
+	if (!susfs_is_sid_equal(current_cred(), susfs_zygote_sid))
+		goto no_susfs;
+
+	if (unlikely(is_uid_manager(new_uid)))
+		goto no_susfs;
+
+	// Isolated services spawned by zygote are always umounted.
+	if (is_isolated_process(new_uid)) {
+		susfs_set_current_proc_no_su();
+		susfs_set_current_proc_umounted();
+		goto do_susfs_umount;
+	}
+
+	// Normal user app that should be umounted.
+	if (likely(is_appuid(new_uid) && ksu_uid_should_umount(new_uid))) {
+		susfs_set_current_proc_no_su();
+		susfs_set_current_proc_umounted();
+		goto do_susfs_umount;
+	}
+
+	if (ksu_is_allow_uid_for_current(new_uid)) {
+		goto no_susfs;
+	}
+
+	susfs_set_current_proc_no_su();
+	goto no_susfs;
+
+do_susfs_umount:
+	ksu_handle_umount(old_uid, new_uid);
+	if (!work_pending(&susfs_extra_works))
+		schedule_work(&susfs_extra_works);
+	return 0;
+
+no_susfs:
+#endif
 
     if (unlikely(is_uid_manager(new_uid))) {
 

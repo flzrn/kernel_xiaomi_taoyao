@@ -7,6 +7,10 @@
 #include <linux/workqueue.h>
 
 #include "preinit/preinit.h"
+
+#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs.h>
+#endif
 #include "policy/allowlist.h"
 #include "policy/app_profile.h"
 #include "policy/feature.h"
@@ -149,6 +153,10 @@ int __init kernelsu_init(void)
 	ksu_selinux_hide_init();
 
 	ksu_supercalls_init();
+
+#ifdef CONFIG_KSU_SUSFS
+	susfs_init();
+#endif
 
 	ksu_app_profile_init();
 
