@@ -1805,6 +1805,7 @@ static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 #define MIN_DISCHARGE_STEP_NS	(20 * NSEC_PER_SEC)
 #define MIN_CHARGE_STEP_NS	(10 * NSEC_PER_SEC)
 #define SLEEP_RESET_INTERVAL_NS	(300 * NSEC_PER_SEC)
+#define COUNTER_REFRESH_NS	(5 * NSEC_PER_SEC)
 
 static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 					      struct psy_state *pst,
@@ -1813,7 +1814,9 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 	static DEFINE_SPINLOCK(soc_lock);
 	static int last_soc = -1;
 	static s64 last_change_ns;
+	static s64 last_counter_query_ns;
 	static u32 cached_charge_full;
+	static u32 cached_charge_counter;
 	u32 charge_full, charge_counter;
 	int rc, raw_soc, target_soc;
 	bool is_charging;
@@ -1823,7 +1826,9 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 	if (!bcdev->use_charge_counter_soc_calib)
 		return fallback_soc;
 
-	/* 1. Read or use cached charge_full to eliminate redundant GLINK traffic */
+	now = ktime_get_boottime_ns();
+
+	/* 1. Read or use cached charge_full once to eliminate redundant GLINK traffic */
 	if (!cached_charge_full) {
 		rc = read_property_id(bcdev, pst, BATT_CHG_FULL);
 		if (rc >= 0 && pst->prop[BATT_CHG_FULL] > 0)
@@ -1831,31 +1836,45 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 	}
 	charge_full = cached_charge_full ? cached_charge_full : pst->prop[BATT_CHG_FULL];
 
-	/* 2. Read real-time charge_counter */
-	rc = read_property_id(bcdev, pst, BATT_CHG_COUNTER);
-	if (rc >= 0)
-		charge_counter = pst->prop[BATT_CHG_COUNTER];
-	else
-		charge_counter = 0;
-
-	/* 3. Calculate raw Coulomb-counter SOC */
-	if (charge_full > 0 && charge_counter > 0 &&
-	    charge_counter <= (charge_full + (charge_full / 20))) {
-		raw_soc = DIV_ROUND_CLOSEST_ULL((u64)charge_counter * 100,
-						charge_full);
-		target_soc = clamp_t(int, raw_soc, 0, 100);
-	} else {
-		target_soc = fallback_soc;
+	/* 2. Rate-limit reading real-time charge_counter over GLINK.
+	 * Polling GLINK on every single capacity read starves USB-PD / charger
+	 * handshake, causing USB disconnect/reconnect loops (spam reconnect).
+	 * Only query GLINK at most once every COUNTER_REFRESH_NS (5s).
+	 */
+	if (!last_counter_query_ns || (now - last_counter_query_ns >= COUNTER_REFRESH_NS)) {
+		rc = read_property_id(bcdev, pst, BATT_CHG_COUNTER);
+		if (rc >= 0) {
+			cached_charge_counter = pst->prop[BATT_CHG_COUNTER];
+			last_counter_query_ns = now;
+		}
 	}
+	charge_counter = last_counter_query_ns ? cached_charge_counter : pst->prop[BATT_CHG_COUNTER];
 
-	/* 4. Determine if charging or discharging */
+	/* 3. Determine if charging or discharging */
 	is_charging = (pst->prop[BATT_STATUS] == POWER_SUPPLY_STATUS_CHARGING ||
 		       pst->prop[BATT_STATUS] == POWER_SUPPLY_STATUS_FULL ||
 		       bcdev->psy_list[PSY_TYPE_USB].prop[USB_ONLINE]);
 
+	/* 4. Calculate raw Coulomb-counter SOC with low-battery blending.
+	 * Below 10%, physical Coulomb counters can zero-calibrate early (near nominal
+	 * cutoff voltage) while the PMIC voltage fuel-gauge still reports 3-5%.
+	 * Never let raw Coulomb 0% override a valid non-zero fuel-gauge reading!
+	 */
+	if (charge_full > 0 && charge_counter > 0 &&
+	    charge_counter <= (charge_full + (charge_full / 20))) {
+		raw_soc = DIV_ROUND_CLOSEST_ULL((u64)charge_counter * 100, charge_full);
+		raw_soc = clamp_t(int, raw_soc, 0, 100);
+
+		if (raw_soc < 10 && fallback_soc > raw_soc)
+			target_soc = fallback_soc;
+		else
+			target_soc = raw_soc;
+	} else {
+		target_soc = fallback_soc;
+	}
+
 	/* 5. Time-guarded monotonic step smoother */
 	spin_lock_irqsave(&soc_lock, flags);
-	now = ktime_get_boottime_ns();
 
 	if (last_soc < 0) {
 		/* First read at boot: initialize directly without delay */
@@ -1867,8 +1886,13 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 		return target_soc;
 	}
 
-	/* Critical empty override: allow 0% through immediately for clean shutdown */
-	if (target_soc == 0) {
+	/* Critical empty override:
+	 * ONLY pass 0% through immediately if the device is DISCHARGING,
+	 * previously was already near empty (<= 2%), and BOTH target_soc
+	 * and fallback_soc confirm 0%.
+	 * NEVER force 0% while charging (which caused the 'reset to 0% at 5%' bug)!
+	 */
+	if (!is_charging && target_soc == 0 && fallback_soc == 0 && last_soc <= 2) {
 		last_soc = 0;
 		last_change_ns = now;
 		spin_unlock_irqrestore(&soc_lock, flags);
@@ -1886,7 +1910,7 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 	}
 
 	if (is_charging) {
-		/* Charging: strictly step up by at most 1% every 10 seconds */
+		/* Charging: smoothly step up by at most 1% every 10 seconds */
 		if (target_soc > last_soc && elapsed >= MIN_CHARGE_STEP_NS) {
 			last_soc++;
 			last_change_ns = now;
