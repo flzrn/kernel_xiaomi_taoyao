@@ -486,8 +486,19 @@ struct battery_chg_dev {
 	bool				support_wireless_charge;
 	bool				support_2s_charging;
 	bool				use_charge_counter_soc_calib;
+	spinlock_t			soc_lock;
+	int				last_soc;
+	s64				last_change_ns;
+	s64				last_counter_query_ns;
+	u32				cached_charge_full;
+	u32				cached_charge_counter;
+	bool				boot_stabilized;
+	int				boot_highest_soc;
+	int				boot_samples;
+	int				boot_zero_count;
 	struct delayed_work		xm_prop_change_work;
 	struct delayed_work		charger_debug_info_print_work;
+	struct delayed_work		boot_soc_work;
 	/* To track the driver initialization status */
 	bool				initialized;
 };
@@ -1805,15 +1816,132 @@ static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 #define MIN_DISCHARGE_STEP_NS	(20 * NSEC_PER_SEC)
 #define MIN_CHARGE_STEP_NS	(10 * NSEC_PER_SEC)
 #define SLEEP_RESET_INTERVAL_NS	(300 * NSEC_PER_SEC)
+#define COUNTER_REFRESH_NS	(5 * NSEC_PER_SEC)
+#define BOOT_STABILIZE_WINDOW_NS (15 * NSEC_PER_SEC)
+
+static void battery_soc_boot_work(struct work_struct *work)
+{
+	struct battery_chg_dev *bcdev = container_of(work,
+					struct battery_chg_dev, boot_soc_work.work);
+	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
+	unsigned long flags;
+	s64 now;
+	int rc, raw_soc, fallback_soc, target_soc;
+	u32 charge_full, charge_counter;
+	bool is_charging, should_lock = false;
+	unsigned int retry_delay_ms = 4000;
+
+	if (!bcdev->use_charge_counter_soc_calib)
+		return;
+
+	/* All GLINK reads happen OUTSIDE the spinlock */
+	now = ktime_get_boottime_ns();
+
+	if (!bcdev->cached_charge_full) {
+		rc = read_property_id(bcdev, pst, BATT_CHG_FULL);
+		if (rc >= 0 && pst->prop[BATT_CHG_FULL] > 0)
+			bcdev->cached_charge_full = pst->prop[BATT_CHG_FULL];
+	}
+	charge_full = bcdev->cached_charge_full ? bcdev->cached_charge_full : pst->prop[BATT_CHG_FULL];
+
+	rc = read_property_id(bcdev, pst, BATT_CHG_COUNTER);
+	if (rc >= 0) {
+		bcdev->cached_charge_counter = pst->prop[BATT_CHG_COUNTER];
+		bcdev->last_counter_query_ns = now;
+	}
+	charge_counter = bcdev->last_counter_query_ns ? bcdev->cached_charge_counter : pst->prop[BATT_CHG_COUNTER];
+
+	rc = read_property_id(bcdev, pst, BATT_CAPACITY);
+#if defined(CONFIG_BQ_FUEL_GAUGE)
+	fallback_soc = pst->prop[BATT_CAPACITY] / 100;
+#else
+	fallback_soc = DIV_ROUND_CLOSEST(pst->prop[BATT_CAPACITY], 100);
+#endif
+
+	is_charging = (pst->prop[BATT_STATUS] == POWER_SUPPLY_STATUS_CHARGING ||
+		       pst->prop[BATT_STATUS] == POWER_SUPPLY_STATUS_FULL ||
+		       bcdev->psy_list[PSY_TYPE_USB].prop[USB_ONLINE]);
+
+	/*
+	 * Calculate raw Coulomb-counter SOC with calibration sanity check.
+	 * If charge_counter has not yet restored state (e.g. unseeded reset value
+	 * yielding raw_soc <= 5% while PMIC OCV fallback_soc is healthy > 15%),
+	 * or if fallback_soc is not yet valid (> 0), discard raw_soc as uncalibrated.
+	 */
+	if (fallback_soc > 0 && charge_full > 0 && charge_counter > 0 &&
+	    charge_counter <= (charge_full + (charge_full / 20))) {
+		raw_soc = DIV_ROUND_CLOSEST_ULL((u64)charge_counter * 100, charge_full);
+		raw_soc = clamp_t(int, raw_soc, 0, 100);
+
+		if (raw_soc <= 5 && fallback_soc > 15)
+			target_soc = fallback_soc;
+		else if (raw_soc < 10 && fallback_soc > raw_soc)
+			target_soc = fallback_soc;
+		else
+			target_soc = raw_soc;
+	} else {
+		target_soc = fallback_soc;
+	}
+
+	spin_lock_irqsave(&bcdev->soc_lock, flags);
+	if (bcdev->boot_stabilized) {
+		spin_unlock_irqrestore(&bcdev->soc_lock, flags);
+		return;
+	}
+
+	/* Check verified dead battery at boot (discharging, 0%/0% confirmed twice) */
+	if (!is_charging && target_soc == 0 && fallback_soc == 0) {
+		bcdev->boot_zero_count++;
+		if (bcdev->boot_zero_count >= 2) {
+			bcdev->last_soc = 0;
+			bcdev->last_change_ns = now;
+			bcdev->boot_stabilized = true;
+			should_lock = true;
+			pr_info("qti_battery_charger: verified dead battery at boot (0%%)\n");
+		}
+	} else {
+		bcdev->boot_zero_count = 0;
+	}
+
+	if (!should_lock) {
+		/*
+		 * If telemetry is unready (fallback_soc <= 0) and battery is not
+		 * confirmed dead, do not count this sample or latch boot_highest_soc
+		 * unless we reached the hard upper bound timeout (15s).
+		 */
+		if (fallback_soc <= 0 && now < BOOT_STABILIZE_WINDOW_NS && !is_charging) {
+			if (!delayed_work_pending(&bcdev->boot_soc_work))
+				schedule_delayed_work(&bcdev->boot_soc_work, msecs_to_jiffies(1000));
+			spin_unlock_irqrestore(&bcdev->soc_lock, flags);
+			return;
+		}
+
+		bcdev->boot_samples++;
+		if (target_soc > bcdev->boot_highest_soc)
+			bcdev->boot_highest_soc = target_soc;
+
+		if (bcdev->boot_samples >= 3 || now >= BOOT_STABILIZE_WINDOW_NS || is_charging) {
+			bcdev->last_soc = max(0, bcdev->boot_highest_soc);
+			bcdev->last_change_ns = now;
+			bcdev->boot_stabilized = true;
+			should_lock = true;
+			pr_info("qti_battery_charger: boot SOC stabilized at %d%% (samples=%d, elapsed=%lld ms)\n",
+				bcdev->last_soc, bcdev->boot_samples, ktime_to_ms(now));
+		} else {
+			if (!delayed_work_pending(&bcdev->boot_soc_work))
+				schedule_delayed_work(&bcdev->boot_soc_work, msecs_to_jiffies(retry_delay_ms));
+		}
+	}
+	spin_unlock_irqrestore(&bcdev->soc_lock, flags);
+
+	if (should_lock && pst->psy)
+		power_supply_changed(pst->psy);
+}
 
 static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 					      struct psy_state *pst,
 					      int fallback_soc)
 {
-	static DEFINE_SPINLOCK(soc_lock);
-	static int last_soc = -1;
-	static s64 last_change_ns;
-	static u32 cached_charge_full;
 	u32 charge_full, charge_counter;
 	int rc, raw_soc, target_soc;
 	bool is_charging;
@@ -1823,85 +1951,167 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 	if (!bcdev->use_charge_counter_soc_calib)
 		return fallback_soc;
 
-	/* 1. Read or use cached charge_full to eliminate redundant GLINK traffic */
-	if (!cached_charge_full) {
+	now = ktime_get_boottime_ns();
+
+	/* 1. Read or use cached charge_full once to eliminate redundant GLINK traffic */
+	if (!bcdev->cached_charge_full) {
 		rc = read_property_id(bcdev, pst, BATT_CHG_FULL);
 		if (rc >= 0 && pst->prop[BATT_CHG_FULL] > 0)
-			cached_charge_full = pst->prop[BATT_CHG_FULL];
+			bcdev->cached_charge_full = pst->prop[BATT_CHG_FULL];
 	}
-	charge_full = cached_charge_full ? cached_charge_full : pst->prop[BATT_CHG_FULL];
+	charge_full = bcdev->cached_charge_full ? bcdev->cached_charge_full : pst->prop[BATT_CHG_FULL];
 
-	/* 2. Read real-time charge_counter */
-	rc = read_property_id(bcdev, pst, BATT_CHG_COUNTER);
-	if (rc >= 0)
-		charge_counter = pst->prop[BATT_CHG_COUNTER];
-	else
-		charge_counter = 0;
-
-	/* 3. Calculate raw Coulomb-counter SOC */
-	if (charge_full > 0 && charge_counter > 0 &&
-	    charge_counter <= (charge_full + (charge_full / 20))) {
-		raw_soc = DIV_ROUND_CLOSEST_ULL((u64)charge_counter * 100,
-						charge_full);
-		target_soc = clamp_t(int, raw_soc, 0, 100);
-	} else {
-		target_soc = fallback_soc;
+	/* 2. Rate-limit reading real-time charge_counter over GLINK.
+	 * Polling GLINK on every single capacity read starves USB-PD / charger
+	 * handshake, causing USB disconnect/reconnect loops (spam reconnect).
+	 * Only query GLINK at most once every COUNTER_REFRESH_NS (5s).
+	 */
+	if (!bcdev->last_counter_query_ns || (now - bcdev->last_counter_query_ns >= COUNTER_REFRESH_NS)) {
+		rc = read_property_id(bcdev, pst, BATT_CHG_COUNTER);
+		if (rc >= 0) {
+			bcdev->cached_charge_counter = pst->prop[BATT_CHG_COUNTER];
+			bcdev->last_counter_query_ns = now;
+		}
 	}
+	charge_counter = bcdev->last_counter_query_ns ? bcdev->cached_charge_counter : pst->prop[BATT_CHG_COUNTER];
 
-	/* 4. Determine if charging or discharging */
+	/* 3. Determine if charging or discharging */
 	is_charging = (pst->prop[BATT_STATUS] == POWER_SUPPLY_STATUS_CHARGING ||
 		       pst->prop[BATT_STATUS] == POWER_SUPPLY_STATUS_FULL ||
 		       bcdev->psy_list[PSY_TYPE_USB].prop[USB_ONLINE]);
 
-	/* 5. Time-guarded monotonic step smoother */
-	spin_lock_irqsave(&soc_lock, flags);
-	now = ktime_get_boottime_ns();
+	/* 4. Calculate raw Coulomb-counter SOC with calibration sanity check.
+	 * Only trust raw_soc if fallback_soc is valid (> 0) and raw_soc is not
+	 * an unseeded hardware reset value (e.g. raw_soc <= 5% while fallback > 15%).
+	 * Below 10%, never let raw Coulomb 0% override a valid non-zero fuel-gauge reading.
+	 */
+	if (fallback_soc > 0 && charge_full > 0 && charge_counter > 0 &&
+	    charge_counter <= (charge_full + (charge_full / 20))) {
+		raw_soc = DIV_ROUND_CLOSEST_ULL((u64)charge_counter * 100, charge_full);
+		raw_soc = clamp_t(int, raw_soc, 0, 100);
 
-	if (last_soc < 0) {
-		/* First read at boot: initialize directly without delay */
-		if (target_soc > 0 || charge_counter > 0) {
-			last_soc = target_soc;
-			last_change_ns = now;
-		}
-		spin_unlock_irqrestore(&soc_lock, flags);
-		return target_soc;
+		if (raw_soc <= 5 && fallback_soc > 15)
+			target_soc = fallback_soc;
+		else if (raw_soc < 10 && fallback_soc > raw_soc)
+			target_soc = fallback_soc;
+		else
+			target_soc = raw_soc;
+	} else {
+		target_soc = fallback_soc;
 	}
 
-	/* Critical empty override: allow 0% through immediately for clean shutdown */
-	if (target_soc == 0) {
-		last_soc = 0;
-		last_change_ns = now;
-		spin_unlock_irqrestore(&soc_lock, flags);
+	/* 5. State machine under soc_lock */
+	spin_lock_irqsave(&bcdev->soc_lock, flags);
+
+	if (!bcdev->boot_stabilized) {
+		/* Charger connected at boot: immediately short-circuit to steady-state */
+		if (is_charging && target_soc > 0) {
+			bcdev->last_soc = target_soc;
+			bcdev->last_change_ns = now;
+			bcdev->boot_stabilized = true;
+			spin_unlock_irqrestore(&bcdev->soc_lock, flags);
+			pr_info("qti_battery_charger: boot on charger, latched SOC: %d%%\n", bcdev->last_soc);
+			return target_soc;
+		}
+
+		/* Check verified dead battery at boot (discharging, 0%/0% confirmed twice) */
+		if (!is_charging && target_soc == 0 && fallback_soc == 0) {
+			bcdev->boot_zero_count++;
+			if (bcdev->boot_zero_count >= 2) {
+				bcdev->last_soc = 0;
+				bcdev->last_change_ns = now;
+				bcdev->boot_stabilized = true;
+				spin_unlock_irqrestore(&bcdev->soc_lock, flags);
+				pr_info("qti_battery_charger: confirmed dead battery at boot (0%%)\n");
+				return 0;
+			}
+		} else {
+			bcdev->boot_zero_count = 0;
+		}
+
+		/*
+		 * If telemetry is not yet ready (fallback_soc <= 0) and not confirmed dead,
+		 * do NOT latch boot_highest_soc to 0 or 1. Return fallback_soc directly and
+		 * let boot_soc_work retry until valid telemetry arrives or timeout elapses.
+		 */
+		if (fallback_soc <= 0 && now < BOOT_STABILIZE_WINDOW_NS) {
+			if (!delayed_work_pending(&bcdev->boot_soc_work))
+				schedule_delayed_work(&bcdev->boot_soc_work, msecs_to_jiffies(1000));
+			spin_unlock_irqrestore(&bcdev->soc_lock, flags);
+			return fallback_soc;
+		}
+
+		bcdev->boot_samples++;
+		if (bcdev->boot_highest_soc < 0) {
+			/* First valid boot read: initialize candidate with max(target_soc, fallback_soc) */
+			bcdev->boot_highest_soc = max(target_soc, fallback_soc);
+			if (!delayed_work_pending(&bcdev->boot_soc_work))
+				schedule_delayed_work(&bcdev->boot_soc_work, msecs_to_jiffies(4000));
+			pr_info("qti_battery_charger: initial boot read, provisional SOC: %d%%\n", bcdev->boot_highest_soc);
+		} else {
+			if (target_soc > bcdev->boot_highest_soc)
+				bcdev->boot_highest_soc = target_soc;
+		}
+
+		/* Check if window has elapsed or enough samples collected */
+		if (bcdev->boot_samples >= 3 || now >= BOOT_STABILIZE_WINDOW_NS) {
+			bcdev->last_soc = max(0, bcdev->boot_highest_soc);
+			bcdev->last_change_ns = now;
+			bcdev->boot_stabilized = true;
+			pr_info("qti_battery_charger: boot window ended, locked SOC: %d%%\n", bcdev->last_soc);
+			spin_unlock_irqrestore(&bcdev->soc_lock, flags);
+			return bcdev->last_soc;
+		}
+
+		/* Organic userspace query during boot window returns boot_highest_soc */
+		spin_unlock_irqrestore(&bcdev->soc_lock, flags);
+		return bcdev->boot_highest_soc;
+	}
+
+	/* 6. Critical empty override (steady-state):
+	 * ONLY pass 0% through immediately if the device is DISCHARGING,
+	 * previously was already near empty (<= 2%), and BOTH target_soc
+	 * and fallback_soc confirm 0%.
+	 * NEVER force 0% while charging (which caused the 'reset to 0% at 5%' bug)!
+	 */
+	if (!is_charging && target_soc == 0 && fallback_soc == 0 && bcdev->last_soc <= 2) {
+		bcdev->last_soc = 0;
+		bcdev->last_change_ns = now;
+		spin_unlock_irqrestore(&bcdev->soc_lock, flags);
 		return 0;
 	}
 
-	elapsed = now - last_change_ns;
+	elapsed = now - bcdev->last_change_ns;
 
-	/* If phone was in deep sleep / suspended for > 5 minutes, resync to real level */
+	/* 7. Deep sleep resync:
+	 * If phone was in deep sleep / suspended for > 5 minutes, resync to real level.
+	 * In deep sleep current is ~0mA, so cell voltage is rested OCV.
+	 */
 	if (elapsed > SLEEP_RESET_INTERVAL_NS) {
-		last_soc = target_soc;
-		last_change_ns = now;
-		spin_unlock_irqrestore(&soc_lock, flags);
+		bcdev->last_soc = target_soc;
+		bcdev->last_change_ns = now;
+		spin_unlock_irqrestore(&bcdev->soc_lock, flags);
 		return target_soc;
 	}
 
+	/* 8. Steady-state monotonic smoother */
 	if (is_charging) {
-		/* Charging: strictly step up by at most 1% every 10 seconds */
-		if (target_soc > last_soc && elapsed >= MIN_CHARGE_STEP_NS) {
-			last_soc++;
-			last_change_ns = now;
+		/* Charging: smoothly step up by at most 1% every 10 seconds */
+		if (target_soc > bcdev->last_soc && elapsed >= MIN_CHARGE_STEP_NS) {
+			bcdev->last_soc++;
+			bcdev->last_change_ns = now;
 		}
 	} else {
 		/* Discharging: strictly step down by at most 1% every 20 seconds.
 		 * NEVER drops 2-5% in one step, and NEVER bounces upward while unplugged. */
-		if (target_soc < last_soc && elapsed >= MIN_DISCHARGE_STEP_NS) {
-			last_soc--;
-			last_change_ns = now;
+		if (target_soc < bcdev->last_soc && elapsed >= MIN_DISCHARGE_STEP_NS) {
+			bcdev->last_soc--;
+			bcdev->last_change_ns = now;
 		}
 	}
 
-	target_soc = clamp_t(int, last_soc, 0, 100);
-	spin_unlock_irqrestore(&soc_lock, flags);
+	target_soc = clamp_t(int, bcdev->last_soc, 0, 100);
+	spin_unlock_irqrestore(&bcdev->soc_lock, flags);
 
 	return target_soc;
 }
@@ -3099,6 +3309,8 @@ static int battery_chg_shutdown(struct notifier_block *nb, unsigned long code,
 	struct battery_chg_dev *bcdev = container_of(nb, struct battery_chg_dev,
 						     shutdown_notifier);
 	int rc;
+
+	cancel_delayed_work_sync(&bcdev->boot_soc_work);
 
 	msg.hdr.owner = MSG_OWNER_BC;
 	msg.hdr.type = MSG_TYPE_REQ_RESP;
@@ -5922,6 +6134,9 @@ static int battery_chg_probe(struct platform_device *pdev)
 
 	mutex_init(&bcdev->rw_lock);
 	spin_lock_init(&bcdev->ack_lock);
+	spin_lock_init(&bcdev->soc_lock);
+	bcdev->last_soc = -1;
+	bcdev->boot_highest_soc = -1;
 	init_completion(&bcdev->ack);
 	init_completion(&bcdev->fw_buf_ack);
 	init_completion(&bcdev->fw_update_ack);
@@ -6006,6 +6221,7 @@ static int battery_chg_probe(struct platform_device *pdev)
 
 	INIT_DELAYED_WORK( &bcdev->xm_prop_change_work, generate_xm_charge_uvent);
 	INIT_DELAYED_WORK( &bcdev->charger_debug_info_print_work, xm_charger_debug_info_print_work);
+	INIT_DELAYED_WORK(&bcdev->boot_soc_work, battery_soc_boot_work);
 	schedule_delayed_work(&bcdev->charger_debug_info_print_work, 5 * HZ);
 
 	bcdev->slave_fg_verify_flag = false;
@@ -6021,6 +6237,7 @@ static int battery_chg_probe(struct platform_device *pdev)
 	return 0;
 error:
 	bcdev->initialized = false;
+	cancel_delayed_work_sync(&bcdev->boot_soc_work);
 	complete(&bcdev->ack);
 	pmic_glink_unregister_client(bcdev->client);
 	mi_disp_unregister_client(&bcdev->fb_notifier);
@@ -6033,6 +6250,7 @@ static int battery_chg_remove(struct platform_device *pdev)
 	struct battery_chg_dev *bcdev = platform_get_drvdata(pdev);
 	int rc;
 
+	cancel_delayed_work_sync(&bcdev->boot_soc_work);
 	device_init_wakeup(bcdev->dev, false);
 	debugfs_remove_recursive(bcdev->debugfs_dir);
 	class_unregister(&bcdev->battery_class);
