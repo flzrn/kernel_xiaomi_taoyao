@@ -1640,9 +1640,7 @@ config KALLSYMS
 
 config KALLSYMS_ALL
 	bool "Include all symbols in kallsyms"
-	# taoyao: DEBUG_KERNEL dropped from the dependency so KALLSYMS_ALL can be
-	# enabled without turning on the whole debug menu.
-	depends on KALLSYMS
+	depends on DEBUG_KERNEL && KALLSYMS
 	help
 	   Normally kallsyms only contains the symbols of functions for nicer
 	   OOPS messages and backtraces (i.e., symbols from the text and inittext
