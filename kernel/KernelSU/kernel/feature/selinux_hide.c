@@ -203,6 +203,9 @@ static const struct ksu_dirty_rule ksu_dirty_rules[] = {
     { "u:r:magisk:s0",        "u:r:droidspacesd:s0"         },
     { "u:r:su:s0",            "u:r:droidspacesd:s0"         },
     { "u:r:system_server:s0", "u:r:droidspacesd:s0"         },
+    { "u:r:system_server:s0", "u:r:system_server:s0"         },
+    { "u:r:kernel:s0",        "u:object_r:adb_data_file:s0" },
+    { "u:r:system_server:s0", "u:object_r:apk_data_file:s0" },
 };
 
 static bool ksu_is_dirty_access_query(const char *scon, const char *tcon)
@@ -308,13 +311,13 @@ static __nocfi ssize_t ksu_sel_write(struct file *file, const char __user *ubuf,
         goto passthrough;
     kbuf[len] = 0;
 
-    if (ino == KSU_SEL_CONTEXT_INO) {
-        if (ksu_should_hide_context(kbuf)) {
-            pr_info_ratelimited("selinux_hide: blocked context: %.40s\n", kbuf);
-            return -EINVAL;
-        }
-        goto passthrough;
+    if (ksu_should_hide_context(kbuf)) {
+        pr_info_ratelimited("selinux_hide: blocked context (ino %lu): %.40s\n", (unsigned long)ino, kbuf);
+        return -EINVAL;
     }
+
+    if (ino == KSU_SEL_CONTEXT_INO)
+        goto passthrough;
 
     ret = orig_sel_write(file, ubuf, size, pos);
     if (ret <= 0)
@@ -325,14 +328,12 @@ static __nocfi ssize_t ksu_sel_write(struct file *file, const char __user *ubuf,
         char scon[128], tcon[128];
         unsigned int tclass_num;
 
-        if (ksu_should_hide_context(kbuf))
-            deny = true;
-
         if (sscanf(kbuf, "%127s %127s %u", scon, tcon, &tclass_num) == 3 &&
             ksu_is_dirty_access_query(scon, tcon))
             deny = true;
 
-        ksu_fix_access_response(file->private_data, deny);
+        if (deny)
+            ksu_fix_access_response(file->private_data, true);
     }
 
     return ret;
@@ -523,7 +524,9 @@ static int ksu_selinux_hide_init_thread(void *data)
     ksu_selinux_hide_add_type("droidspacesd");
     ksu_selinux_hide_add_type("droidspaces");
     ksu_selinux_hide_add_type("lsposed_file");
+    ksu_selinux_hide_add_type("xposed_file");
     ksu_selinux_hide_add_type("xposed_data");
+    ksu_selinux_hide_add_type("adbroot");
     ksu_selinux_hide_add_type("msd_app");
     ksu_selinux_hide_add_type("msd_daemon");
 
