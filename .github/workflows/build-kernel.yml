@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 180
     steps:
       - name: Checkout
@@ -34,7 +34,9 @@ jobs:
 
       - name: Install build deps
         run: |
-          echo "nameserver 8.8.8.8" | sudo tee -a /etc/resolv.conf > /dev/null || true
+          sudo rm -f /etc/resolv.conf
+          echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" | sudo tee /etc/resolv.conf > /dev/null
+          sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' /etc/apt/sources.list /etc/apt/sources.list.d/* /etc/apt/apt-mirrors.txt 2>/dev/null || true
           for i in 1 2 3; do
             sudo apt-get update -qq && break || sleep 4
           done
