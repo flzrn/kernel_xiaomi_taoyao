@@ -128,7 +128,7 @@ int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
 			  void __user **arg)
 {
 	if (magic1 != KSU_INSTALL_MAGIC1)
-		return 0;
+		return 1;
 
 #ifdef CONFIG_KSU_SUSFS
 	// SUSFS shares the sys_reboot supercall (magic2 == SUSFS_MAGIC).
@@ -361,9 +361,10 @@ int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
 		// we write our confirmation on **
 		if (copy_to_user((void __user *)*arg, &reply, sizeof(reply)))
 			return 0;
+		return 0;
 	}
 
-	return 0;
+	return 1;
 }
 
 #ifdef KSU_KPROBES_HOOK
