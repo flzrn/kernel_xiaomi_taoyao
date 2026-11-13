@@ -113,6 +113,11 @@ jobs:
           for n in z.namelist():
               z.extract(n, '/tmp/ak3')
           EOF
+          # taoyao is virtual A/B: inside a recovery /postinstall/tmp exists, which
+          # makes AnyKernel3 flip SLOT to the inactive slot and silently flash
+          # boot_a while the device boots boot_b. Pin the active slot instead.
+          sed -i 's/^do\.cleanup=1$/do.cleanup=1\nslot_select=active;/' /tmp/ak3/anykernel.sh
+          grep -n "slot_select" /tmp/ak3/anykernel.sh
           cp -v "${IMG}"  /tmp/ak3/Image
           cp -v "${DTBO}" /tmp/ak3/dtbo.img
           cp -v "${DTB}"  /tmp/ak3/dtb
