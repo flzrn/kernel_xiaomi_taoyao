@@ -116,8 +116,10 @@ jobs:
           # taoyao is virtual A/B: inside a recovery /postinstall/tmp exists, which
           # makes AnyKernel3 flip SLOT to the inactive slot and silently flash
           # boot_a while the device boots boot_b. Pin the active slot instead.
-          sed -i 's/^do\.cleanup=1$/do.cleanup=1\nslot_select=active;/' /tmp/ak3/anykernel.sh
-          grep -n "slot_select" /tmp/ak3/anykernel.sh
+          # The bundled core (20260225) ignores the properties() block, so the
+          # top-level SLOT_SELECT variable is the one that takes effect.
+          sed -i 's/^IS_SLOT_DEVICE=auto;$/IS_SLOT_DEVICE=auto;\nSLOT_SELECT=active;/' /tmp/ak3/anykernel.sh
+          grep -n "SLOT_SELECT" /tmp/ak3/anykernel.sh
           cp -v "${IMG}"  /tmp/ak3/Image
           cp -v "${DTBO}" /tmp/ak3/dtbo.img
           cp -v "${DTB}"  /tmp/ak3/dtb
