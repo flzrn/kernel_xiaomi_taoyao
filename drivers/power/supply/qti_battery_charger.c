@@ -491,10 +491,12 @@ struct battery_chg_dev {
 	s64				last_change_ns;
 	s64				last_counter_query_ns;
 	s64				last_capacity_query_ns;
+	s64				last_auth_unlock_ns;
 	u32				cached_charge_full;
 	u32				cached_charge_counter;
 	u32				cached_capacity;
 	bool				boot_stabilized;
+	bool				failsafe_recovering;
 	int				boot_highest_soc;
 	int				boot_samples;
 	int				boot_zero_count;
@@ -1820,6 +1822,61 @@ static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 #define SLEEP_RESET_INTERVAL_NS	(300 * NSEC_PER_SEC)
 #define COUNTER_REFRESH_NS	(5 * NSEC_PER_SEC)
 #define BOOT_STABILIZE_WINDOW_NS (15 * NSEC_PER_SEC)
+#define AUTH_UNLOCK_RETRY_NS	(5 * NSEC_PER_SEC)
+
+/*
+ * Some aftermarket fuel gauges do not implement the digest challenge used by
+ * the userspace batterysecret daemon: the ADSP echoes the 32-byte challenge
+ * back instead of returning a keyed HMAC, so the daemon can never set
+ * authentic=1. While authentic stays 0 the ADSP keeps the gauge in fail-safe
+ * and reports charge_full=0 / charge_counter=0, which makes the SOC unusable.
+ *
+ * Ask the ADSP to enable the gauge directly, but only while the counters
+ * still report that exact fail-safe signature (never on healthy telemetry)
+ * and at most once every AUTH_UNLOCK_RETRY_NS.
+ */
+static void battery_try_unlock_failsafe(struct battery_chg_dev *bcdev,
+					struct psy_state *pst,
+					u32 *charge_full, u32 *charge_counter)
+{
+	struct psy_state *xm_pst = &bcdev->psy_list[PSY_TYPE_XM];
+	s64 now = ktime_get_boottime_ns();
+	int rc;
+
+	*charge_full = bcdev->cached_charge_full;
+	*charge_counter = bcdev->cached_charge_counter;
+
+	if (bcdev->last_auth_unlock_ns &&
+	    now - bcdev->last_auth_unlock_ns < AUTH_UNLOCK_RETRY_NS)
+		return;
+
+	bcdev->last_auth_unlock_ns = now;
+
+	rc = read_property_id(bcdev, xm_pst, XM_PROP_AUTHENTIC);
+	if (rc < 0 || xm_pst->prop[XM_PROP_AUTHENTIC])
+		return;
+
+	rc = write_property_id(bcdev, xm_pst, XM_PROP_AUTHENTIC, 1);
+	if (rc < 0) {
+		pr_err_ratelimited("qti_battery_charger: fuel gauge unlock failed, rc=%d\n",
+				   rc);
+		return;
+	}
+
+	pr_warn_ratelimited("qti_battery_charger: fuel gauge digest unsupported, forcing authentic=1 (fail-safe recovery)\n");
+
+	/* Refresh the counters so this call can already report a real SOC */
+	rc = read_property_id(bcdev, pst, BATT_CHG_FULL);
+	if (rc >= 0 && pst->prop[BATT_CHG_FULL] > 0)
+		bcdev->cached_charge_full = pst->prop[BATT_CHG_FULL];
+
+	rc = read_property_id(bcdev, pst, BATT_CHG_COUNTER);
+	if (rc >= 0)
+		bcdev->cached_charge_counter = pst->prop[BATT_CHG_COUNTER];
+
+	*charge_full = bcdev->cached_charge_full;
+	*charge_counter = bcdev->cached_charge_counter;
+}
 
 static void battery_soc_boot_work(struct work_struct *work)
 {
@@ -1830,7 +1887,7 @@ static void battery_soc_boot_work(struct work_struct *work)
 	s64 now;
 	int rc, raw_soc, fallback_soc, target_soc;
 	u32 charge_full, charge_counter, max_valid_counter;
-	bool is_charging, is_failsafe_100, should_lock = false;
+	bool is_charging, is_failsafe_100, is_failsafe_low, should_lock = false;
 	unsigned int retry_delay_ms = 4000;
 
 	if (!bcdev->use_charge_counter_soc_calib)
@@ -1872,9 +1929,16 @@ static void battery_soc_boot_work(struct work_struct *work)
 		       pst->prop[BATT_STATUS] == POWER_SUPPLY_STATUS_FULL ||
 		       bcdev->psy_list[PSY_TYPE_USB].prop[USB_ONLINE]);
 
+	/* Zero counters mean the gauge is stuck in ADSP fail-safe, not empty */
+	if (charge_full == 0 && charge_counter == 0)
+		battery_try_unlock_failsafe(bcdev, pst, &charge_full,
+					    &charge_counter);
+
 	max_valid_counter = is_charging ? (charge_full + (charge_full / 20)) : charge_full;
 	is_failsafe_100 = (!is_charging && fallback_soc >= 100 &&
 			   (charge_counter == 0 || charge_counter > charge_full));
+	is_failsafe_low = (!is_charging && fallback_soc > 0 &&
+			   charge_full == 0 && charge_counter == 0);
 
 	/*
 	 * Calculate raw Coulomb-counter SOC with calibration sanity check.
@@ -1922,10 +1986,10 @@ static void battery_soc_boot_work(struct work_struct *work)
 	if (!should_lock) {
 		/*
 		 * If telemetry is unready (fallback_soc <= 0) or stuck in ADSP fail-safe
-		 * while discharging (is_failsafe_100), do not count sample or latch boot_highest_soc.
+		 * while discharging (is_failsafe_100/is_failsafe_low), do not count sample or latch boot_highest_soc.
 		 */
-		if ((fallback_soc <= 0 || is_failsafe_100) && now < BOOT_STABILIZE_WINDOW_NS) {
-			if (is_failsafe_100)
+		if ((fallback_soc <= 0 || is_failsafe_100 || is_failsafe_low) && now < BOOT_STABILIZE_WINDOW_NS) {
+			if (is_failsafe_100 || is_failsafe_low)
 				pr_warn_ratelimited("qti_battery_charger: ADSP fail-safe active (cc=%u, fallback=%d%%); retrying\n",
 						    charge_counter, fallback_soc);
 			if (!delayed_work_pending(&bcdev->boot_soc_work))
@@ -1975,7 +2039,8 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 {
 	u32 charge_full, charge_counter, max_valid_counter;
 	int rc, raw_soc, target_soc;
-	bool is_charging, is_failsafe_100;
+	bool is_charging, is_failsafe_100, is_failsafe_low, gauge_failsafe;
+	bool recovered = false;
 	unsigned long flags;
 	s64 now, elapsed;
 
@@ -2010,9 +2075,21 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 		       pst->prop[BATT_STATUS] == POWER_SUPPLY_STATUS_FULL ||
 		       bcdev->psy_list[PSY_TYPE_USB].prop[USB_ONLINE]);
 
+	/* Zero counters mean the gauge is stuck in ADSP fail-safe, not empty */
+	if (charge_full == 0 && charge_counter == 0)
+		battery_try_unlock_failsafe(bcdev, pst, &charge_full,
+					    &charge_counter);
+
 	max_valid_counter = is_charging ? (charge_full + (charge_full / 20)) : charge_full;
 	is_failsafe_100 = (!is_charging && fallback_soc >= 100 &&
 			   (charge_counter == 0 || charge_counter > charge_full));
+	gauge_failsafe = (charge_full == 0 && charge_counter == 0);
+	is_failsafe_low = (!is_charging && fallback_soc > 0 && gauge_failsafe);
+
+	if (gauge_failsafe)
+		bcdev->failsafe_recovering = true;
+	else if (bcdev->failsafe_recovering)
+		recovered = true;
 
 	/* 4. Calculate raw Coulomb-counter SOC with calibration sanity check.
 	 * Only trust raw_soc if fallback_soc is valid (> 0) and raw_soc is not
@@ -2041,7 +2118,7 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 
 	if (!bcdev->boot_stabilized) {
 		/* Charger connected at boot: immediately short-circuit to steady-state */
-		if (is_charging && target_soc > 0) {
+		if (is_charging && target_soc > 0 && !gauge_failsafe) {
 			bcdev->last_soc = target_soc;
 			bcdev->last_change_ns = now;
 			bcdev->boot_stabilized = true;
@@ -2067,11 +2144,11 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 
 		/*
 		 * If telemetry is unready (fallback_soc <= 0) or stuck in ADSP fail-safe
-		 * while discharging (is_failsafe_100), do NOT latch boot_highest_soc to 0 or 100.
+		 * while discharging (is_failsafe_100/is_failsafe_low), do NOT latch boot_highest_soc to 0 or 100.
 		 * Return fallback_soc directly and let boot_soc_work retry until valid telemetry arrives.
 		 */
-		if ((fallback_soc <= 0 || is_failsafe_100) && now < BOOT_STABILIZE_WINDOW_NS) {
-			if (is_failsafe_100)
+		if ((fallback_soc <= 0 || is_failsafe_100 || is_failsafe_low) && now < BOOT_STABILIZE_WINDOW_NS) {
+			if (is_failsafe_100 || is_failsafe_low)
 				pr_warn_ratelimited("qti_battery_charger: ADSP fail-safe active (cc=%u, fallback=%d%%); retrying\n",
 						    charge_counter, fallback_soc);
 			if (!delayed_work_pending(&bcdev->boot_soc_work))
@@ -2118,6 +2195,21 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 		/* Organic userspace query during boot window returns boot_highest_soc */
 		spin_unlock_irqrestore(&bcdev->soc_lock, flags);
 		return bcdev->boot_highest_soc;
+	}
+
+	/*
+	 * The gauge just came back from ADSP fail-safe. The smoothed value is
+	 * still pinned at the fail-safe reading (usually 1%), so resync instead
+	 * of ramp-stepping (which would need hours to climb back).
+	 */
+	if (recovered) {
+		bcdev->failsafe_recovering = false;
+		bcdev->last_soc = target_soc;
+		bcdev->last_change_ns = now;
+		spin_unlock_irqrestore(&bcdev->soc_lock, flags);
+		pr_info("qti_battery_charger: fuel gauge recovered, resync SOC to %d%%\n",
+			target_soc);
+		return target_soc;
 	}
 
 	/* 6. Critical empty override (steady-state):
