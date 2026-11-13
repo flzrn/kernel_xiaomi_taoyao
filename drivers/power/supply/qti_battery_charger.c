@@ -497,6 +497,7 @@ struct battery_chg_dev {
 	u32				cached_capacity;
 	bool				boot_stabilized;
 	bool				failsafe_recovering;
+	bool				auth_unlock_logged;
 	int				boot_highest_soc;
 	int				boot_samples;
 	int				boot_zero_count;
@@ -1852,10 +1853,12 @@ static void battery_try_unlock_failsafe(struct battery_chg_dev *bcdev,
 
 	bcdev->last_auth_unlock_ns = now;
 
-	rc = read_property_id(bcdev, xm_pst, XM_PROP_AUTHENTIC);
-	if (rc < 0 || xm_pst->prop[XM_PROP_AUTHENTIC])
-		return;
-
+	/*
+	 * Do not trust the current authentic value: when the digest challenge is
+	 * in flight the ADSP keeps reporting authentic=1 while the gauge is still
+	 * in fail-safe (charge_full=0, charge_counter=0). Re-assert the request
+	 * until the counters really come back instead of trusting the flag.
+	 */
 	rc = write_property_id(bcdev, xm_pst, XM_PROP_AUTHENTIC, 1);
 	if (rc < 0) {
 		pr_err_ratelimited("qti_battery_charger: fuel gauge unlock failed, rc=%d\n",
@@ -1863,7 +1866,10 @@ static void battery_try_unlock_failsafe(struct battery_chg_dev *bcdev,
 		return;
 	}
 
-	pr_warn_ratelimited("qti_battery_charger: fuel gauge digest unsupported, forcing authentic=1 (fail-safe recovery)\n");
+	if (!bcdev->auth_unlock_logged) {
+		bcdev->auth_unlock_logged = true;
+		pr_warn("qti_battery_charger: fuel gauge digest unsupported, forcing authentic=1 (fail-safe recovery)\n");
+	}
 
 	/* Refresh the counters so this call can already report a real SOC */
 	rc = read_property_id(bcdev, pst, BATT_CHG_FULL);
@@ -2204,6 +2210,7 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 	 */
 	if (recovered) {
 		bcdev->failsafe_recovering = false;
+		bcdev->auth_unlock_logged = false;
 		bcdev->last_soc = target_soc;
 		bcdev->last_change_ns = now;
 		spin_unlock_irqrestore(&bcdev->soc_lock, flags);
