@@ -35,6 +35,7 @@
    Based on the proc code and the fs/nfsd/nfsctl.c code. */
 
 #include "flask.h"
+#include "av_permissions.h"
 #include "avc.h"
 #include "avc_ss.h"
 #include "security.h"
@@ -857,6 +858,14 @@ static ssize_t sel_write_access(struct file *file, char *buf, size_t size)
 		goto out;
 
 	security_compute_av_user(state, ssid, tsid, tclass, &avd);
+
+	/* Mask out non-stock dynamic rules queried by DirtySepolicy probes */
+	if (scon && tcon) {
+		if (strstr(scon, "dex2oat") && strstr(tcon, "dex2oat_exec"))
+			avd.allowed &= ~FILE__EXECUTE_NO_TRANS;
+		if (strstr(scon, "fsck_untrusted"))
+			avd.allowed &= ~CAPABILITY__SYS_ADMIN;
+	}
 
 	length = scnprintf(buf, SIMPLE_TRANSACTION_LIMIT,
 			  "%x %x %x %x %u %x",
