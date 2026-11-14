@@ -1940,9 +1940,10 @@ static void battery_soc_boot_work(struct work_struct *work)
 		battery_try_unlock_failsafe(bcdev, pst, &charge_full,
 					    &charge_counter);
 
-	max_valid_counter = is_charging ? (charge_full + (charge_full / 20)) : charge_full;
+	/* Allow +5% float headroom when fully charged, clamped to 100% */
+	max_valid_counter = charge_full + (charge_full / 20);
 	is_failsafe_100 = (!is_charging && fallback_soc >= 100 &&
-			   (charge_counter == 0 || charge_counter > charge_full));
+			   (charge_counter == 0 || charge_counter > max_valid_counter));
 	is_failsafe_low = (!is_charging && fallback_soc > 0 &&
 			   charge_full == 0 && charge_counter == 0);
 
@@ -2086,9 +2087,10 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 		battery_try_unlock_failsafe(bcdev, pst, &charge_full,
 					    &charge_counter);
 
-	max_valid_counter = is_charging ? (charge_full + (charge_full / 20)) : charge_full;
+	/* Allow +5% float headroom when fully charged, clamped to 100% */
+	max_valid_counter = charge_full + (charge_full / 20);
 	is_failsafe_100 = (!is_charging && fallback_soc >= 100 &&
-			   (charge_counter == 0 || charge_counter > charge_full));
+			   (charge_counter == 0 || charge_counter > max_valid_counter));
 	gauge_failsafe = (charge_full == 0 && charge_counter == 0);
 	is_failsafe_low = (!is_charging && fallback_soc > 0 && gauge_failsafe);
 
@@ -2529,6 +2531,13 @@ static void battery_chg_subsys_up_work(struct work_struct *work)
 	 * USB ICL.
 	 */
 	msleep(200);
+
+	/*
+	 * Initialize battery authentication immediately upon GLINK link establishment.
+	 * This ensures the ADSP fuel gauge is active from early boot without waiting
+	 * for any userspace daemons.
+	 */
+	write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_XM], XM_PROP_AUTHENTIC, 1);
 
 	if (bcdev->last_fcc_ua) {
 		rc = __battery_psy_set_charge_current(bcdev,
@@ -3539,9 +3548,21 @@ static ssize_t authentic_store(struct class *c,
 	if (kstrtobool(buf, &val))
 		return -EINVAL;
 
-	pr_err("authentic_store: %d\n", val);
+	/*
+	 * Third-party and replacement batteries may not implement the proprietary
+	 * Xiaomi challenge-response HMAC digest. In that case, vendor batterysecret
+	 * daemon writes 0 here when HMAC verification fails.
+	 * NEVER forward a de-authentication (0) to the ADSP, which drops the
+	 * fuel gauge into fail-safe (0mAh / 1% SOC). Always ensure the gauge
+	 * remains authentic=1 so that no userspace patch or module is required.
+	 */
+	if (!val)
+		pr_warn_ratelimited("authentic_store: userspace requested authentic=0, forcing 1 to prevent ADSP fail-safe lock\n");
+	else
+		pr_info("authentic_store: %d\n", val);
+
 	rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_XM],
-				XM_PROP_AUTHENTIC, val);
+				XM_PROP_AUTHENTIC, 1);
 	if (rc < 0)
 		return rc;
 
@@ -3610,10 +3631,13 @@ static ssize_t slave_authentic_store(struct class *c,
 	if (kstrtobool(buf, &val))
 		return -EINVAL;
 
-	pr_err("slave_authentic_store: %d\n", val);
+	if (!val)
+		pr_warn_ratelimited("slave_authentic_store: userspace requested slave_authentic=0, forcing 1\n");
+	else
+		pr_info("slave_authentic_store: %d\n", val);
 
 	rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_XM],
-				XM_PROP_SLAVE_AUTHENTIC, val);
+				XM_PROP_SLAVE_AUTHENTIC, 1);
 	if (rc < 0)
 		return rc;
 
