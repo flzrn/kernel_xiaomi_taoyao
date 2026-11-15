@@ -6238,11 +6238,12 @@ static int battery_chg_parse_dt(struct battery_chg_dev *bcdev)
 	bcdev->support_wireless_charge = of_property_read_bool(node, "mi,support-wireless");
 	bcdev->support_2s_charging  = of_property_read_bool(node, "mi,support-2s-charging");
 	/*
-	 * The shipped DTBs (dtbo) of every available taoyao ROM do not carry the
-	 * vendor calibration property, so the sanitised SOC path below was dead
-	 * code on this device while the raw ADSP capacity was passed through
-	 * untouched. Keep the property as an explicit opt-out for other boards and
-	 * enable the path by default here.
+	 * The taoyao overlay DTS sets mi,use-charge-counter-soc-calibration and
+	 * that overlay is packaged as dtbo.img, but the DT the kernel finally sees
+	 * is assembled by the bootloader from the base DT plus that overlay. Do not
+	 * depend on a single property surviving that merge: enable the sanitised
+	 * SOC path by default and keep mi,disable-charge-counter-soc-calibration as
+	 * the opt-out for boards that want the raw ADSP capacity.
 	 */
 	bcdev->use_charge_counter_soc_calib =
 		!of_property_read_bool(node, "mi,disable-charge-counter-soc-calibration");
