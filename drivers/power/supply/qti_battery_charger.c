@@ -2260,16 +2260,22 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 
 	/*
 	 * Charge termination: as soon as the charger and the fused estimate agree
-	 * that the pack is full, report 100%. Without this the Coulomb ratio is
-	 * capped by charge_full (design capacity), so an aged or replacement cell
-	 * plateaus a few points short and only reaches 100% after a reboot.
+	 * that the pack is full, walk the reported value up to 100%. Closing the
+	 * last points through the same one-per-step smoother as the rest of the
+	 * curve keeps the UI monotonic, while never stopping short: without this
+	 * the Coulomb ratio is capped by charge_full (design capacity), so an aged
+	 * or replacement cell plateaus a few points short and only reaches 100%
+	 * after a reboot.
 	 */
 	if (is_charging && (target_soc >= SOC_FULL_PCT ||
 			    pst->prop[BATT_STATUS] == POWER_SUPPLY_STATUS_FULL)) {
-		bcdev->last_soc = 100;
-		bcdev->last_change_ns = now;
+		if (bcdev->last_soc < 100 && elapsed >= MIN_CHARGE_STEP_NS) {
+			bcdev->last_soc++;
+			bcdev->last_change_ns = now;
+		}
+		target_soc = clamp_t(int, bcdev->last_soc, 0, 100);
 		spin_unlock_irqrestore(&bcdev->soc_lock, flags);
-		return 100;
+		return target_soc;
 	}
 
 	/*
