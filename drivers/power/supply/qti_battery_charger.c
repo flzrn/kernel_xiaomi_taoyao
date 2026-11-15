@@ -2280,13 +2280,18 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 
 	/*
 	 * Deep sleep resync: after a long suspend the cell is rested, so the
-	 * fused estimate is trustworthy again. Only jump when the disagreement is
-	 * larger than the blend margin; otherwise a stale timestamp would push a
-	 * few points through and defeat the smoother (the classic "10% became 13%
-	 * while idle" artifact).
+	 * fused estimate is trustworthy again. Two guards keep this from
+	 * reintroducing the artifacts the smoother exists to hide:
+	 *  - only jump on a disagreement larger than the blend margin, so a stale
+	 *    timestamp cannot push a few points through;
+	 *  - while discharging only ever resync downwards. The gauge recovering
+	 *    upwards after a rest is physically reasonable but reads as the
+	 *    "10% became 13% while idle" bug, and there is no charging input to
+	 *    explain it.
 	 */
 	if (elapsed > SLEEP_RESET_INTERVAL_NS &&
-	    abs(target_soc - bcdev->last_soc) >= SOC_DIVERGENCE_PCT) {
+	    abs(target_soc - bcdev->last_soc) >= SOC_DIVERGENCE_PCT &&
+	    (is_charging || target_soc < bcdev->last_soc)) {
 		bcdev->last_soc = target_soc;
 		bcdev->last_change_ns = now;
 		spin_unlock_irqrestore(&bcdev->soc_lock, flags);
