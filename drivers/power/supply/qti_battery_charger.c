@@ -1824,6 +1824,38 @@ static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 #define COUNTER_REFRESH_NS	(5 * NSEC_PER_SEC)
 #define BOOT_STABILIZE_WINDOW_NS (15 * NSEC_PER_SEC)
 #define AUTH_UNLOCK_RETRY_NS	(5 * NSEC_PER_SEC)
+/* ADSP capacity and the Coulomb counter only disagree this much when one of the
+ * two is unhealthy (unseeded counter, fail-safe telemetry). Below this margin
+ * the fused vendor estimate wins: it is OCV-corrected, restart-stable and it is
+ * the value that reaches 100% on charge termination.
+ */
+#define SOC_DIVERGENCE_PCT	8
+/* Charge is considered terminated at/above this level while a charger is on. */
+#define SOC_FULL_PCT		99
+
+/*
+ * Pick the SOC the state machine should converge on.
+ *
+ * raw_soc < 0 means the Coulomb path was unusable this round (fail-safe or
+ * unseeded counters), so the ADSP value is the only option.
+ */
+static int battery_soc_blend(int raw_soc, int fallback_soc)
+{
+	/* Unseeded counter after reset: never let it drag a healthy gauge down */
+	if (raw_soc > 0 && raw_soc <= 5 && fallback_soc > 15)
+		return fallback_soc;
+
+	if (raw_soc < 0)
+		return fallback_soc > 0 ? fallback_soc : 0;
+
+	if (fallback_soc <= 0)
+		return raw_soc;
+
+	if (abs(raw_soc - fallback_soc) >= SOC_DIVERGENCE_PCT)
+		return raw_soc;
+
+	return fallback_soc;
+}
 
 /*
  * Some aftermarket fuel gauges do not implement the digest challenge used by
@@ -1959,16 +1991,11 @@ static void battery_soc_boot_work(struct work_struct *work)
 	    charge_counter <= max_valid_counter) {
 		raw_soc = DIV_ROUND_CLOSEST_ULL((u64)charge_counter * 100, charge_full);
 		raw_soc = clamp_t(int, raw_soc, 0, 100);
-
-		if (raw_soc <= 5 && fallback_soc > 15)
-			target_soc = fallback_soc;
-		else if (raw_soc < 10 && fallback_soc > raw_soc)
-			target_soc = fallback_soc;
-		else
-			target_soc = raw_soc;
 	} else {
-		target_soc = fallback_soc;
+		raw_soc = -1;
 	}
+
+	target_soc = battery_soc_blend(raw_soc, fallback_soc);
 
 	spin_lock_irqsave(&bcdev->soc_lock, flags);
 	if (bcdev->boot_stabilized) {
@@ -2099,27 +2126,21 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 	else if (bcdev->failsafe_recovering)
 		recovered = true;
 
-	/* 4. Calculate raw Coulomb-counter SOC with calibration sanity check.
-	 * Only trust raw_soc if fallback_soc is valid (> 0) and raw_soc is not
-	 * an unseeded hardware reset value (e.g. raw_soc <= 5% while fallback > 15%).
-	 * Below 10%, never let raw Coulomb 0% override a valid non-zero fuel-gauge reading.
-	 * Only allow +5% float headroom when actively connected to a charger.
-	 * While discharging, reject uncalibrated counter overflow (> charge_full).
+	/*
+	 * Calculate raw Coulomb-counter SOC, then let battery_soc_blend() decide
+	 * between it and the fused ADSP estimate. An unusable counter (fail-safe,
+	 * unseeded after reset) is reported as raw_soc < 0 instead of being
+	 * coerced to a percentage, so it can never win the blend.
 	 */
 	if (fallback_soc > 0 && charge_full > 0 && charge_counter > 0 &&
 	    charge_counter <= max_valid_counter) {
 		raw_soc = DIV_ROUND_CLOSEST_ULL((u64)charge_counter * 100, charge_full);
 		raw_soc = clamp_t(int, raw_soc, 0, 100);
-
-		if (raw_soc <= 5 && fallback_soc > 15)
-			target_soc = fallback_soc;
-		else if (raw_soc < 10 && fallback_soc > raw_soc)
-			target_soc = fallback_soc;
-		else
-			target_soc = raw_soc;
 	} else {
-		target_soc = fallback_soc;
+		raw_soc = -1;
 	}
+
+	target_soc = battery_soc_blend(raw_soc, fallback_soc);
 
 	/* 5. State machine under soc_lock */
 	spin_lock_irqsave(&bcdev->soc_lock, flags);
@@ -2180,8 +2201,9 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 
 		bcdev->boot_samples++;
 		if (bcdev->boot_highest_soc < 0) {
-			/* First valid boot read: initialize candidate with max(target_soc, fallback_soc) */
-			bcdev->boot_highest_soc = max(target_soc, fallback_soc);
+			/* First valid boot read: the blended estimate is already
+			 * OCV-corrected, so do not inflate it with max(). */
+			bcdev->boot_highest_soc = target_soc;
 			if (!delayed_work_pending(&bcdev->boot_soc_work))
 				schedule_delayed_work(&bcdev->boot_soc_work, msecs_to_jiffies(4000));
 			pr_info("qti_battery_charger: initial boot read, provisional SOC: %d%%\n", bcdev->boot_highest_soc);
@@ -2236,11 +2258,29 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 
 	elapsed = now - bcdev->last_change_ns;
 
-	/* 7. Deep sleep resync:
-	 * If phone was in deep sleep / suspended for > 5 minutes, resync to real level.
-	 * In deep sleep current is ~0mA, so cell voltage is rested OCV.
+	/*
+	 * Charge termination: as soon as the charger and the fused estimate agree
+	 * that the pack is full, report 100%. Without this the Coulomb ratio is
+	 * capped by charge_full (design capacity), so an aged or replacement cell
+	 * plateaus a few points short and only reaches 100% after a reboot.
 	 */
-	if (elapsed > SLEEP_RESET_INTERVAL_NS) {
+	if (is_charging && (target_soc >= SOC_FULL_PCT ||
+			    pst->prop[BATT_STATUS] == POWER_SUPPLY_STATUS_FULL)) {
+		bcdev->last_soc = 100;
+		bcdev->last_change_ns = now;
+		spin_unlock_irqrestore(&bcdev->soc_lock, flags);
+		return 100;
+	}
+
+	/*
+	 * Deep sleep resync: after a long suspend the cell is rested, so the
+	 * fused estimate is trustworthy again. Only jump when the disagreement is
+	 * larger than the blend margin; otherwise a stale timestamp would push a
+	 * few points through and defeat the smoother (the classic "10% became 13%
+	 * while idle" artifact).
+	 */
+	if (elapsed > SLEEP_RESET_INTERVAL_NS &&
+	    abs(target_soc - bcdev->last_soc) >= SOC_DIVERGENCE_PCT) {
 		bcdev->last_soc = target_soc;
 		bcdev->last_change_ns = now;
 		spin_unlock_irqrestore(&bcdev->soc_lock, flags);
@@ -6186,8 +6226,15 @@ static int battery_chg_parse_dt(struct battery_chg_dev *bcdev)
 
 	bcdev->support_wireless_charge = of_property_read_bool(node, "mi,support-wireless");
 	bcdev->support_2s_charging  = of_property_read_bool(node, "mi,support-2s-charging");
+	/*
+	 * The shipped DTBs (dtbo) of every available taoyao ROM do not carry the
+	 * vendor calibration property, so the sanitised SOC path below was dead
+	 * code on this device while the raw ADSP capacity was passed through
+	 * untouched. Keep the property as an explicit opt-out for other boards and
+	 * enable the path by default here.
+	 */
 	bcdev->use_charge_counter_soc_calib =
-		of_property_read_bool(node, "mi,use-charge-counter-soc-calibration");
+		!of_property_read_bool(node, "mi,disable-charge-counter-soc-calibration");
 
 	return 0;
 }
