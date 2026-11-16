@@ -496,11 +496,13 @@ struct battery_chg_dev {
 	u32				cached_charge_counter;
 	u32				cached_capacity;
 	bool				boot_stabilized;
+	bool				boot_provisional;
 	bool				failsafe_recovering;
 	bool				auth_unlock_logged;
 	int				boot_highest_soc;
 	int				boot_samples;
 	int				boot_zero_count;
+	s64				last_volt_query_ns;
 	struct delayed_work		xm_prop_change_work;
 	struct delayed_work		charger_debug_info_print_work;
 	struct delayed_work		boot_soc_work;
@@ -1832,6 +1834,25 @@ static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 #define SOC_DIVERGENCE_PCT	8
 /* Charge is considered terminated at/above this level while a charger is on. */
 #define SOC_FULL_PCT		99
+/*
+ * Boot low-SOC guard.
+ *
+ * While the fuel gauge is still starting, the ADSP can answer a capacity query
+ * with a 1% placeholder while charge_counter reads 0, even though the cell is
+ * half full. Publishing that latches the boot value, and because the
+ * steady-state smoother only walks down while discharging, the display then
+ * stays at 1% until the next deep-sleep resync five minutes later -- which is
+ * long enough to reach the low-battery shutdown path.
+ *
+ * So: a Coulomb counter at or below 1% of charge_full is treated as unusable
+ * (an unseeded counter cannot be told apart from an empty one), and while the
+ * pack is above SOC_BOOT_GUARD_UV a suspect low reading is replaced by a
+ * coarse voltage estimate. Below that voltage the reading is trusted, so a
+ * genuinely empty pack still reports low and still shuts the device down.
+ */
+#define SOC_BOOT_GUARD_NS	(60 * NSEC_PER_SEC)
+#define SOC_BOOT_SUSPECT_PCT	5
+#define SOC_BOOT_GUARD_UV	3500000
 
 /*
  * Pick the SOC the state machine should converge on.
@@ -1855,6 +1876,107 @@ static int battery_soc_blend(int raw_soc, int fallback_soc)
 		return raw_soc;
 
 	return fallback_soc;
+}
+
+/*
+ * An unseeded Coulomb counter reads 0 after a gauge reset, which is
+ * indistinguishable from an empty pack. Anything at or below 1% of charge_full
+ * is therefore treated as unusable rather than as a real 1%.
+ */
+static bool battery_counter_unusable(u32 charge_full, u32 charge_counter)
+{
+	if (!charge_full)
+		return true;
+
+	return charge_counter <= charge_full / 100;
+}
+
+/*
+ * Coarse single-cell Li-ion OCV table, consulted only to replace an implausible
+ * boot reading. Deliberately conservative: it never returns a high value for a
+ * low voltage, and the caller only uses it above SOC_BOOT_GUARD_UV.
+ */
+static int battery_soc_from_voltage(u32 uv)
+{
+	static const struct {
+		u32 uv;
+		u8 soc;
+	} table[] = {
+		{ 4160000, 100 }, { 4100000, 92 }, { 4050000, 85 },
+		{ 4000000, 78 },  { 3960000, 73 },  { 3920000, 67 },
+		{ 3900000, 62 },  { 3870000, 55 },  { 3840000, 48 },
+		{ 3820000, 43 },  { 3800000, 40 },  { 3780000, 35 },
+		{ 3760000, 30 },  { 3740000, 27 },  { 3710000, 22 },
+		{ 3680000, 18 },  { 3640000, 13 },  { 3580000, 9 },
+		{ 3500000, 4 },
+	};
+	unsigned int i;
+
+	if (!uv)
+		return -1;
+
+	for (i = 0; i < ARRAY_SIZE(table); i++)
+		if (uv >= table[i].uv)
+			return table[i].soc;
+
+	return 0;
+}
+
+/*
+ * Replace a suspect low reading while the pack is clearly not empty.
+ *
+ * Returns the value to publish. *guarded is set when the reading was rejected,
+ * which tells the caller to keep the boot window open (or to hold the last
+ * value in steady state) instead of latching the placeholder.
+ */
+static int battery_soc_boot_guard(struct battery_chg_dev *bcdev,
+				  struct psy_state *pst, int soc, s64 now,
+				  bool *guarded)
+{
+	u32 uv;
+	int vsoc;
+
+	*guarded = false;
+
+	if (soc > SOC_BOOT_SUSPECT_PCT)
+		return soc;
+
+	/* On a charger a low reading is plausible; do not second-guess it. */
+	if (pst->prop[BATT_STATUS] == POWER_SUPPLY_STATUS_CHARGING ||
+	    pst->prop[BATT_STATUS] == POWER_SUPPLY_STATUS_FULL ||
+	    bcdev->psy_list[PSY_TYPE_USB].prop[USB_ONLINE])
+		return soc;
+
+	/* Refresh voltage instead of trusting a stale cached value. */
+	if (!bcdev->last_volt_query_ns ||
+	    now - bcdev->last_volt_query_ns >= COUNTER_REFRESH_NS) {
+		bcdev->last_volt_query_ns = now;
+		if (read_property_id(bcdev, pst, BATT_VOLT_NOW) < 0)
+			return soc;
+	}
+	uv = pst->prop[BATT_VOLT_NOW];
+
+	/*
+	 * No voltage (gauge down) or a low voltage (cell really empty): publish
+	 * what we have. Keep the boot window open in the first case so a real
+	 * reading can still be latched.
+	 */
+	if (uv < SOC_BOOT_GUARD_UV) {
+		if (!uv && !bcdev->boot_stabilized &&
+		    battery_counter_unusable(bcdev->cached_charge_full,
+					     bcdev->cached_charge_counter))
+			*guarded = true;
+		return soc;
+	}
+
+	vsoc = battery_soc_from_voltage(uv);
+	if (vsoc <= soc)
+		return soc;
+
+	*guarded = true;
+	pr_info("qti_battery_charger: suspect low SOC (%d%%, counter=%u uAh, %u uV), using %d%%\n",
+		soc, bcdev->cached_charge_counter, uv, vsoc);
+	return vsoc;
 }
 
 /*
@@ -1926,6 +2048,7 @@ static void battery_soc_boot_work(struct work_struct *work)
 	int rc, raw_soc, fallback_soc, target_soc;
 	u32 charge_full, charge_counter, max_valid_counter;
 	bool is_charging, is_failsafe_100, is_failsafe_low, should_lock = false;
+	bool guarded = false;
 	unsigned int retry_delay_ms = 4000;
 
 	if (!bcdev->use_charge_counter_soc_calib)
@@ -1987,7 +2110,8 @@ static void battery_soc_boot_work(struct work_struct *work)
 	 * Only allow +5% float headroom when actively connected to a charger.
 	 * While discharging, reject uncalibrated counter overflow (> charge_full).
 	 */
-	if (fallback_soc > 0 && charge_full > 0 && charge_counter > 0 &&
+	if (fallback_soc > 0 &&
+	    !battery_counter_unusable(charge_full, charge_counter) &&
 	    charge_counter <= max_valid_counter) {
 		raw_soc = DIV_ROUND_CLOSEST_ULL((u64)charge_counter * 100, charge_full);
 		raw_soc = clamp_t(int, raw_soc, 0, 100);
@@ -1996,6 +2120,9 @@ static void battery_soc_boot_work(struct work_struct *work)
 	}
 
 	target_soc = battery_soc_blend(raw_soc, fallback_soc);
+
+	target_soc = battery_soc_boot_guard(bcdev, pst, target_soc, now,
+					    &guarded);
 
 	spin_lock_irqsave(&bcdev->soc_lock, flags);
 	if (bcdev->boot_stabilized) {
@@ -2015,6 +2142,29 @@ static void battery_soc_boot_work(struct work_struct *work)
 		}
 	} else {
 		bcdev->boot_zero_count = 0;
+	}
+
+	/*
+	 * A rejected placeholder must not be latched: keep the window open and
+	 * retry, then latch the estimate once and let the one-shot provisional
+	 * correction take over when real telemetry arrives.
+	 */
+	if (guarded && now < SOC_BOOT_GUARD_NS) {
+		if (!delayed_work_pending(&bcdev->boot_soc_work))
+			schedule_delayed_work(&bcdev->boot_soc_work,
+					      msecs_to_jiffies(1000));
+		spin_unlock_irqrestore(&bcdev->soc_lock, flags);
+		return;
+	}
+
+	if (guarded && !should_lock) {
+		bcdev->last_soc = target_soc;
+		bcdev->last_change_ns = now;
+		bcdev->boot_stabilized = true;
+		bcdev->boot_provisional = true;
+		should_lock = true;
+		pr_warn("qti_battery_charger: gauge still invalid after %lld ms, provisional SOC %d%%\n",
+			ktime_to_ms(now), target_soc);
 	}
 
 	if (!should_lock) {
@@ -2074,7 +2224,7 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 	u32 charge_full, charge_counter, max_valid_counter;
 	int rc, raw_soc, target_soc;
 	bool is_charging, is_failsafe_100, is_failsafe_low, gauge_failsafe;
-	bool recovered = false;
+	bool recovered = false, guarded = false;
 	unsigned long flags;
 	s64 now, elapsed;
 
@@ -2132,7 +2282,8 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 	 * unseeded after reset) is reported as raw_soc < 0 instead of being
 	 * coerced to a percentage, so it can never win the blend.
 	 */
-	if (fallback_soc > 0 && charge_full > 0 && charge_counter > 0 &&
+	if (fallback_soc > 0 &&
+	    !battery_counter_unusable(charge_full, charge_counter) &&
 	    charge_counter <= max_valid_counter) {
 		raw_soc = DIV_ROUND_CLOSEST_ULL((u64)charge_counter * 100, charge_full);
 		raw_soc = clamp_t(int, raw_soc, 0, 100);
@@ -2141,6 +2292,13 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 	}
 
 	target_soc = battery_soc_blend(raw_soc, fallback_soc);
+
+	/*
+	 * Reject a placeholder low reading before it can move the display; see
+	 * the SOC_BOOT_GUARD_* comment. Cheap unless the value is suspect.
+	 */
+	target_soc = battery_soc_boot_guard(bcdev, pst, target_soc, now,
+					    &guarded);
 
 	/* 5. State machine under soc_lock */
 	spin_lock_irqsave(&bcdev->soc_lock, flags);
@@ -2169,6 +2327,30 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 			}
 		} else {
 			bcdev->boot_zero_count = 0;
+		}
+
+		/*
+		 * A rejected placeholder must not be latched: keep the window open
+		 * and retry, then latch the estimate once and let the one-shot
+		 * provisional correction take over when real telemetry arrives.
+		 */
+		if (guarded && now < SOC_BOOT_GUARD_NS) {
+			if (!delayed_work_pending(&bcdev->boot_soc_work))
+				schedule_delayed_work(&bcdev->boot_soc_work,
+						      msecs_to_jiffies(1000));
+			spin_unlock_irqrestore(&bcdev->soc_lock, flags);
+			return target_soc;
+		}
+
+		if (guarded) {
+			bcdev->last_soc = target_soc;
+			bcdev->last_change_ns = now;
+			bcdev->boot_stabilized = true;
+			bcdev->boot_provisional = true;
+			spin_unlock_irqrestore(&bcdev->soc_lock, flags);
+			pr_warn("qti_battery_charger: gauge still invalid after %lld ms, provisional SOC %d%%\n",
+				ktime_to_ms(now), target_soc);
+			return target_soc;
 		}
 
 		/*
@@ -2257,6 +2439,34 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 	}
 
 	elapsed = now - bcdev->last_change_ns;
+
+	/*
+	 * A rejected low reading in steady state freezes the display instead of
+	 * walking it down to the placeholder; the value resumes from real
+	 * telemetry once the gauge answers again.
+	 */
+	if (guarded) {
+		spin_unlock_irqrestore(&bcdev->soc_lock, flags);
+		return bcdev->last_soc;
+	}
+
+	/*
+	 * One-shot correction of a provisional boot latch: replace the voltage
+	 * estimate with real telemetry as soon as it is sane.
+	 */
+	if (bcdev->boot_provisional) {
+		if (target_soc > bcdev->last_soc) {
+			bcdev->last_soc = target_soc;
+			bcdev->last_change_ns = now;
+			bcdev->boot_provisional = false;
+			spin_unlock_irqrestore(&bcdev->soc_lock, flags);
+			pr_info("qti_battery_charger: provisional boot SOC corrected to %d%%\n",
+				target_soc);
+			return target_soc;
+		}
+		if (fallback_soc > SOC_BOOT_SUSPECT_PCT)
+			bcdev->boot_provisional = false;
+	}
 
 	/*
 	 * Charge termination: as soon as the charger and the fused estimate agree
