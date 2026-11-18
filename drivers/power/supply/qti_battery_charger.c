@@ -2168,6 +2168,9 @@ static void battery_soc_boot_work(struct work_struct *work)
 	fallback_soc = DIV_ROUND_CLOSEST(bcdev->last_capacity_query_ns ? bcdev->cached_capacity : pst->prop[BATT_CAPACITY], 100);
 #endif
 
+	/* A corrupt ADSP capacity must never reach the display */
+	fallback_soc = clamp_t(int, fallback_soc, 0, 100);
+
 	is_charging = (pst->prop[BATT_STATUS] == POWER_SUPPLY_STATUS_CHARGING ||
 		       pst->prop[BATT_STATUS] == POWER_SUPPLY_STATUS_FULL ||
 		       bcdev->psy_list[PSY_TYPE_USB].prop[USB_ONLINE]);
@@ -2192,8 +2195,7 @@ static void battery_soc_boot_work(struct work_struct *work)
 	 * Only allow +5% float headroom when actively connected to a charger.
 	 * While discharging, reject uncalibrated counter overflow (> charge_full).
 	 */
-	if (fallback_soc > 0 &&
-	    !battery_counter_unusable(charge_full, charge_counter) &&
+	if (!battery_counter_unusable(charge_full, charge_counter) &&
 	    charge_counter <= max_valid_counter) {
 		raw_soc = DIV_ROUND_CLOSEST_ULL((u64)charge_counter * 100, charge_full);
 		raw_soc = clamp_t(int, raw_soc, 0, 100);
@@ -2254,7 +2256,9 @@ static void battery_soc_boot_work(struct work_struct *work)
 		 * If telemetry is unready (fallback_soc <= 0) or stuck in ADSP fail-safe
 		 * while discharging (is_failsafe_100/is_failsafe_low), do not count sample or latch boot_highest_soc.
 		 */
-		if ((fallback_soc <= 0 || is_failsafe_100 || is_failsafe_low) && now < BOOT_STABILIZE_WINDOW_NS) {
+		if (raw_soc < 0 &&
+		    (fallback_soc <= 0 || is_failsafe_100 || is_failsafe_low) &&
+		    now < BOOT_STABILIZE_WINDOW_NS) {
 			if (is_failsafe_100 || is_failsafe_low)
 				pr_warn_ratelimited("qti_battery_charger: ADSP fail-safe active (cc=%u, fallback=%d%%); retrying\n",
 						    charge_counter, fallback_soc);
@@ -2270,6 +2274,7 @@ static void battery_soc_boot_work(struct work_struct *work)
 		 * Apply progressive backoff (5s up to 60s, then 30s) to eliminate wakeups.
 		 */
 		if (now >= BOOT_STABILIZE_WINDOW_NS && bcdev->boot_highest_soc < 0 &&
+		    raw_soc < 0 &&
 		    (fallback_soc <= 0 || is_failsafe_100 || is_failsafe_low)) {
 			unsigned int failsafe_delay_ms = (now < (60 * NSEC_PER_SEC)) ? 5000 : 30000;
 			if (!delayed_work_pending(&bcdev->boot_soc_work))
@@ -2283,7 +2288,7 @@ static void battery_soc_boot_work(struct work_struct *work)
 			bcdev->boot_highest_soc = target_soc;
 
 		if (bcdev->boot_samples >= 3 || now >= BOOT_STABILIZE_WINDOW_NS || is_charging) {
-			bcdev->last_soc = max(0, bcdev->boot_highest_soc);
+			bcdev->last_soc = clamp_t(int, bcdev->boot_highest_soc, 0, 100);
 			bcdev->last_change_ns = now;
 			bcdev->boot_stabilized = true;
 			should_lock = true;
@@ -2313,6 +2318,9 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 
 	if (!bcdev->use_charge_counter_soc_calib)
 		return fallback_soc;
+
+	/* A corrupt ADSP capacity must never reach the display */
+	fallback_soc = clamp_t(int, fallback_soc, 0, 100);
 
 	now = ktime_get_boottime_ns();
 
@@ -2366,8 +2374,7 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 	 * after reset) is reported as raw_soc < 0 instead of being coerced to a
 	 * percentage, so it can never win.
 	 */
-	if (fallback_soc > 0 &&
-	    !battery_counter_unusable(charge_full, charge_counter) &&
+	if (!battery_counter_unusable(charge_full, charge_counter) &&
 	    charge_counter <= max_valid_counter) {
 		raw_soc = DIV_ROUND_CLOSEST_ULL((u64)charge_counter * 100, charge_full);
 		raw_soc = clamp_t(int, raw_soc, 0, 100);
@@ -2442,7 +2449,9 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 		 * while discharging (is_failsafe_100/is_failsafe_low), do NOT latch boot_highest_soc to 0 or 100.
 		 * Return fallback_soc directly and let boot_soc_work retry until valid telemetry arrives.
 		 */
-		if ((fallback_soc <= 0 || is_failsafe_100 || is_failsafe_low) && now < BOOT_STABILIZE_WINDOW_NS) {
+		if (raw_soc < 0 &&
+		    (fallback_soc <= 0 || is_failsafe_100 || is_failsafe_low) &&
+		    now < BOOT_STABILIZE_WINDOW_NS) {
 			if (is_failsafe_100 || is_failsafe_low)
 				pr_warn_ratelimited("qti_battery_charger: ADSP fail-safe active (cc=%u, fallback=%d%%); retrying\n",
 						    charge_counter, fallback_soc);
@@ -2458,6 +2467,7 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 		 * Apply progressive backoff (5s up to 60s, then 30s) and return live fallback_soc.
 		 */
 		if (now >= BOOT_STABILIZE_WINDOW_NS && bcdev->boot_highest_soc < 0 &&
+		    raw_soc < 0 &&
 		    (fallback_soc <= 0 || is_failsafe_100 || is_failsafe_low)) {
 			unsigned int failsafe_delay_ms = (now < (60 * NSEC_PER_SEC)) ? 5000 : 30000;
 			if (!delayed_work_pending(&bcdev->boot_soc_work))
@@ -2481,7 +2491,7 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 
 		/* Check if window has elapsed or enough samples collected */
 		if (bcdev->boot_samples >= 3 || now >= BOOT_STABILIZE_WINDOW_NS) {
-			bcdev->last_soc = max(0, bcdev->boot_highest_soc);
+			bcdev->last_soc = clamp_t(int, bcdev->boot_highest_soc, 0, 100);
 			bcdev->last_change_ns = now;
 			bcdev->boot_stabilized = true;
 			pr_info("qti_battery_charger: boot window ended, locked SOC: %d%%\n", bcdev->last_soc);
