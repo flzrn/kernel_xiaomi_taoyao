@@ -503,9 +503,7 @@ struct battery_chg_dev {
 	int				boot_highest_soc;
 	int				boot_samples;
 	int				boot_zero_count;
-	int				cached_soc_decimal;
 	s64				last_volt_query_ns;
-	s64				last_soc_decimal_ns;
 	struct delayed_work		xm_prop_change_work;
 	struct delayed_work		charger_debug_info_print_work;
 	struct delayed_work		boot_soc_work;
@@ -1829,14 +1827,13 @@ static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 #define COUNTER_REFRESH_NS	(5 * NSEC_PER_SEC)
 #define BOOT_STABILIZE_WINDOW_NS (15 * NSEC_PER_SEC)
 #define AUTH_UNLOCK_RETRY_NS	(5 * NSEC_PER_SEC)
-/* ADSP capacity and the Coulomb counter only disagree this much when one of the
- * two is unhealthy (unseeded counter, fail-safe telemetry). Below this margin
- * the fused vendor estimate wins: it is OCV-corrected, restart-stable and it is
- * the value that reaches 100% on charge termination.
- */
-#define SOC_DIVERGENCE_PCT	8
 /* Charge is considered terminated at/above this level while a charger is on. */
 #define SOC_FULL_PCT		99
+/*
+ * A jump this large after a long suspend is a real resync, not smoother noise:
+ * the pack has rested, so the gauge value replays trustworthily.
+ */
+#define SOC_RESYNC_PCT		8
 /*
  * Boot low-SOC guard.
  *
@@ -1867,24 +1864,24 @@ static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 #define SOC_PLACEHOLDER_UV	3700000
 #define SOC_PLACEHOLDER_TEMP	500	/* 50.0 degC in 0.1 degC */
 /*
- * Provisional level published while the gauge is not ready and no earlier
- * source is available: above the 15% low-battery warning and far from the
- * 1% shutdown path, yet low enough that it is not mistaken for a healthy
- * reading. Replaced by the first real measurement, in either direction.
+ * Provisional level published while the gauge is not ready: above the 15%
+ * low-battery warning and far from the 1% shutdown path, yet low enough that it
+ * is not mistaken for a healthy reading. Replaced by the first real
+ * measurement, in either direction.
  */
 #define SOC_HOLD_PCT		20
-/* XM soc_decimal is in 0.01%, so 100..10000 is 1..100%. */
-#define SOC_DECIMAL_MIN		100
-#define SOC_DECIMAL_MAX		10000
-#define SOC_DECIMAL_SCALE	100
 /* Retry cadence while the gauge is not ready. */
 #define SOC_FAST_POLL_NS	(1 * NSEC_PER_SEC)
 
 /*
  * Pick the SOC the state machine should converge on.
  *
- * raw_soc < 0 means the Coulomb path was unusable this round (fail-safe or
- * unseeded counters), so the ADSP value is the only option.
+ * The Coulomb counter is the primary source: it is the charge the pack actually
+ * has left, so it follows a heavy load instead of lagging behind it. The fused
+ * ADSP estimate is the fallback for the rounds where the counter cannot be used
+ * (fail-safe telemetry, unseeded counter after a gauge reset).
+ *
+ * raw_soc < 0 means the Coulomb path was unusable this round.
  */
 static int battery_soc_blend(int raw_soc, int fallback_soc)
 {
@@ -1895,13 +1892,7 @@ static int battery_soc_blend(int raw_soc, int fallback_soc)
 	if (raw_soc < 0)
 		return fallback_soc > 0 ? fallback_soc : 0;
 
-	if (fallback_soc <= 0)
-		return raw_soc;
-
-	if (abs(raw_soc - fallback_soc) >= SOC_DIVERGENCE_PCT)
-		return raw_soc;
-
-	return fallback_soc;
+	return raw_soc;
 }
 
 /*
@@ -1951,39 +1942,6 @@ static bool battery_gauge_not_ready(struct battery_chg_dev *bcdev,
 	}
 
 	return true;
-}
-
-/*
- * Earliest usable SOC while the battery channel is not ready.
- *
- * The XM channel answers a decimal SOC through a different opcode and is
- * queried independently of BATT_CAPACITY, so it can be valid before the gauge
- * restores its counters. Anything outside 1..100% is rejected: a stale or
- * unsupported answer must never become a reading.
- */
-static int battery_soc_decimal(struct battery_chg_dev *bcdev, s64 now)
-{
-	struct psy_state *xm_pst = &bcdev->psy_list[PSY_TYPE_XM];
-	u32 val;
-
-	if (!xm_pst->psy)
-		return -1;
-
-	if (bcdev->last_soc_decimal_ns &&
-	    now - bcdev->last_soc_decimal_ns < COUNTER_REFRESH_NS)
-		return bcdev->cached_soc_decimal;
-
-	bcdev->last_soc_decimal_ns = now;
-
-	if (read_property_id(bcdev, xm_pst, XM_PROP_SOC_DECIMAL) < 0)
-		return bcdev->cached_soc_decimal;
-
-	val = xm_pst->prop[XM_PROP_SOC_DECIMAL];
-	if (val < SOC_DECIMAL_MIN || val > SOC_DECIMAL_MAX)
-		return bcdev->cached_soc_decimal;
-
-	bcdev->cached_soc_decimal = val / SOC_DECIMAL_SCALE;
-	return bcdev->cached_soc_decimal;
 }
 
 /*
@@ -2037,20 +1995,14 @@ static int battery_soc_boot_guard(struct battery_chg_dev *bcdev,
 	/*
 	 * The gauge is still starting: capacity, voltage and temperature are
 	 * all placeholders, so neither the 1% capacity nor an OCV guess from
-	 * 3.700 V means anything. Publish the XM decimal SOC when it already
-	 * answers, otherwise a provisional mid level, and keep the boot window
-	 * open so the first real measurement replaces it.
+	 * 3.700 V means anything. The XM channel's soc_decimal cannot help
+	 * either -- it is only the fractional part of the pack's SOC (99 at
+	 * 41.99%), so it carries no level. Publish a provisional mid value and
+	 * keep the boot window open so the first real measurement replaces it.
 	 */
 	if (battery_gauge_not_ready(bcdev, pst, charge_counter)) {
 		bcdev->gauge_not_ready = true;
 		*guarded = true;
-
-		vsoc = battery_soc_decimal(bcdev, now);
-		if (vsoc >= 0) {
-			pr_info("qti_battery_charger: gauge not ready, XM SOC %d%%\n",
-				vsoc);
-			return vsoc;
-		}
 
 		pr_info_ratelimited("qti_battery_charger: gauge not ready (counter=%u, %u uV, %u mC), holding %d%%\n",
 				    charge_counter, pst->prop[BATT_VOLT_NOW],
@@ -2409,10 +2361,10 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 		recovered = true;
 
 	/*
-	 * Calculate raw Coulomb-counter SOC, then let battery_soc_blend() decide
-	 * between it and the fused ADSP estimate. An unusable counter (fail-safe,
-	 * unseeded after reset) is reported as raw_soc < 0 instead of being
-	 * coerced to a percentage, so it can never win the blend.
+	 * Calculate raw Coulomb-counter SOC; battery_soc_blend() then prefers it
+	 * over the fused ADSP estimate. An unusable counter (fail-safe, unseeded
+	 * after reset) is reported as raw_soc < 0 instead of being coerced to a
+	 * percentage, so it can never win.
 	 */
 	if (fallback_soc > 0 &&
 	    !battery_counter_unusable(charge_full, charge_counter) &&
@@ -2516,8 +2468,8 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 
 		bcdev->boot_samples++;
 		if (bcdev->boot_highest_soc < 0) {
-			/* First valid boot read: the blended estimate is already
-			 * OCV-corrected, so do not inflate it with max(). */
+			/* First valid boot read: it is already the counter
+			 * ratio, so do not inflate it with max(). */
 			bcdev->boot_highest_soc = target_soc;
 			if (!delayed_work_pending(&bcdev->boot_soc_work))
 				schedule_delayed_work(&bcdev->boot_soc_work, msecs_to_jiffies(4000));
@@ -2602,8 +2554,8 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 	}
 
 	/*
-	 * Charge termination: as soon as the charger and the fused estimate agree
-	 * that the pack is full, walk the reported value up to 100%. Closing the
+	 * Charge termination: as soon as the counter and the charger agree that
+	 * the pack is full, walk the reported value up to 100%. Closing the
 	 * last points through the same one-per-step smoother as the rest of the
 	 * curve keeps the UI monotonic, while never stopping short: without this
 	 * the Coulomb ratio is capped by charge_full (design capacity), so an aged
@@ -2623,17 +2575,17 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 
 	/*
 	 * Deep sleep resync: after a long suspend the cell is rested, so the
-	 * fused estimate is trustworthy again. Two guards keep this from
+	 * gauge value replays trustworthily again. Two guards keep this from
 	 * reintroducing the artifacts the smoother exists to hide:
-	 *  - only jump on a disagreement larger than the blend margin, so a stale
-	 *    timestamp cannot push a few points through;
+	 *  - only jump on a disagreement larger than the resync margin, so a
+	 *    stale timestamp cannot push a few points through;
 	 *  - while discharging only ever resync downwards. The gauge recovering
 	 *    upwards after a rest is physically reasonable but reads as the
 	 *    "10% became 13% while idle" bug, and there is no charging input to
 	 *    explain it.
 	 */
 	if (elapsed > SLEEP_RESET_INTERVAL_NS &&
-	    abs(target_soc - bcdev->last_soc) >= SOC_DIVERGENCE_PCT &&
+	    abs(target_soc - bcdev->last_soc) >= SOC_RESYNC_PCT &&
 	    (is_charging || target_soc < bcdev->last_soc)) {
 		bcdev->last_soc = target_soc;
 		bcdev->last_change_ns = now;
@@ -6729,7 +6681,6 @@ static int battery_chg_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&bcdev->boot_soc_work, battery_soc_boot_work);
 	bcdev->last_soc = -1;
 	bcdev->boot_highest_soc = -1;
-	bcdev->cached_soc_decimal = -1;
 	init_completion(&bcdev->ack);
 	init_completion(&bcdev->fw_buf_ack);
 	init_completion(&bcdev->fw_update_ack);
