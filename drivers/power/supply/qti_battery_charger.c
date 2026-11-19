@@ -501,6 +501,7 @@ struct battery_chg_dev {
 	bool				failsafe_recovering;
 	bool				auth_unlock_logged;
 	int				boot_highest_soc;
+	int				boot_counter_soc;
 	int				boot_samples;
 	int				boot_zero_count;
 	s64				last_volt_query_ns;
@@ -1908,6 +1909,58 @@ static bool battery_counter_unusable(u32 charge_full, u32 charge_counter)
 	return charge_counter <= charge_full / 100;
 }
 
+/*
+ * Time-based step for the steady-state display.
+ *
+ * One point per *read* let a slow poller lag forever: a five minute gap moved
+ * the display one point while the pack drained five. Move by the number of
+ * whole step_ns intervals that actually elapsed instead, and keep only the
+ * sub-step remainder in last_change_ns, so a slow poller follows a real drain
+ * while a fast poller still cannot move faster than one point per step_ns.
+ * The caller fixes the direction (discharging only steps down, charging only
+ * steps up) and target_soc bounds the movement, so a long gap cannot
+ * overshoot.
+ *
+ * Every whole interval is consumed even when target_soc is already reached:
+ * banking idle time would let a later read jump by points it did not earn
+ * within the measured interval.
+ */
+static void battery_soc_step(struct battery_chg_dev *bcdev, int target_soc,
+			     s64 step_ns, s64 now)
+{
+	s64 elapsed = now - bcdev->last_change_ns;
+	int delta, room, steps;
+
+	if (elapsed < step_ns)
+		return;
+
+	delta = target_soc - bcdev->last_soc;
+	room = delta < 0 ? -delta : delta;
+	steps = (int)(elapsed / step_ns);
+	if (steps > room)
+		steps = room;
+
+	bcdev->last_change_ns += (elapsed / step_ns) * step_ns;
+	if (steps <= 0)
+		return;
+
+	bcdev->last_soc += delta < 0 ? -steps : steps;
+}
+
+/*
+ * The boot latch prefers the value of a usable sample (the Coulomb counter,
+ * or the ADSP rescue value when the counter is clearly unseeded) over max()
+ * across all samples, which remains only for the rounds where the counter was
+ * unusable throughout and still protects against a low ADSP placeholder. An
+ * unconditional max() re-inflated the display on every reboot by the ADSP's
+ * lead over the counter (the 17:46 case: counter 25 %, ADSP 26 %).
+ */
+static int battery_boot_soc(struct battery_chg_dev *bcdev)
+{
+	return bcdev->boot_counter_soc >= 0 ? bcdev->boot_counter_soc
+					    : bcdev->boot_highest_soc;
+}
+
 /* Poll faster while the gauge is still starting. */
 static s64 battery_soc_poll_ns(struct battery_chg_dev *bcdev)
 {
@@ -2284,11 +2337,13 @@ static void battery_soc_boot_work(struct work_struct *work)
 		}
 
 		bcdev->boot_samples++;
+		if (raw_soc >= 0)
+			bcdev->boot_counter_soc = target_soc;
 		if (target_soc > bcdev->boot_highest_soc)
 			bcdev->boot_highest_soc = target_soc;
 
 		if (bcdev->boot_samples >= 3 || now >= BOOT_STABILIZE_WINDOW_NS || is_charging) {
-			bcdev->last_soc = clamp_t(int, bcdev->boot_highest_soc, 0, 100);
+			bcdev->last_soc = clamp_t(int, battery_boot_soc(bcdev), 0, 100);
 			bcdev->last_change_ns = now;
 			bcdev->boot_stabilized = true;
 			should_lock = true;
@@ -2477,6 +2532,8 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 		}
 
 		bcdev->boot_samples++;
+		if (raw_soc >= 0)
+			bcdev->boot_counter_soc = target_soc;
 		if (bcdev->boot_highest_soc < 0) {
 			/* First valid boot read: it is already the counter
 			 * ratio, so do not inflate it with max(). */
@@ -2491,7 +2548,7 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 
 		/* Check if window has elapsed or enough samples collected */
 		if (bcdev->boot_samples >= 3 || now >= BOOT_STABILIZE_WINDOW_NS) {
-			bcdev->last_soc = clamp_t(int, bcdev->boot_highest_soc, 0, 100);
+			bcdev->last_soc = clamp_t(int, battery_boot_soc(bcdev), 0, 100);
 			bcdev->last_change_ns = now;
 			bcdev->boot_stabilized = true;
 			pr_info("qti_battery_charger: boot window ended, locked SOC: %d%%\n", bcdev->last_soc);
@@ -2499,9 +2556,10 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 			return bcdev->last_soc;
 		}
 
-		/* Organic userspace query during boot window returns boot_highest_soc */
+		/* Organic userspace query during boot window returns the best
+		 * sample so far: the counter as soon as it is usable. */
 		spin_unlock_irqrestore(&bcdev->soc_lock, flags);
-		return bcdev->boot_highest_soc;
+		return battery_boot_soc(bcdev);
 	}
 
 	/*
@@ -2574,10 +2632,7 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 	 */
 	if (is_charging && (target_soc >= SOC_FULL_PCT ||
 			    pst->prop[BATT_STATUS] == POWER_SUPPLY_STATUS_FULL)) {
-		if (bcdev->last_soc < 100 && elapsed >= MIN_CHARGE_STEP_NS) {
-			bcdev->last_soc++;
-			bcdev->last_change_ns = now;
-		}
+		battery_soc_step(bcdev, 100, MIN_CHARGE_STEP_NS, now);
 		target_soc = clamp_t(int, bcdev->last_soc, 0, 100);
 		spin_unlock_irqrestore(&bcdev->soc_lock, flags);
 		return target_soc;
@@ -2603,20 +2658,18 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 		return target_soc;
 	}
 
-	/* 8. Steady-state monotonic smoother */
+	/* 8. Steady-state monotonic smoother. A read that is already at the
+	 * target still consumes its time so idle intervals cannot bank up; a
+	 * read whose target is on the forbidden side is left alone so the
+	 * resync below still sees the true time since the last change. */
 	if (is_charging) {
-		/* Charging: smoothly step up by at most 1% every 10 seconds */
-		if (target_soc > bcdev->last_soc && elapsed >= MIN_CHARGE_STEP_NS) {
-			bcdev->last_soc++;
-			bcdev->last_change_ns = now;
-		}
+		if (target_soc >= bcdev->last_soc)
+			battery_soc_step(bcdev, target_soc,
+					 MIN_CHARGE_STEP_NS, now);
 	} else {
-		/* Discharging: strictly step down by at most 1% every 20 seconds.
-		 * NEVER drops 2-5% in one step, and NEVER bounces upward while unplugged. */
-		if (target_soc < bcdev->last_soc && elapsed >= MIN_DISCHARGE_STEP_NS) {
-			bcdev->last_soc--;
-			bcdev->last_change_ns = now;
-		}
+		if (target_soc <= bcdev->last_soc)
+			battery_soc_step(bcdev, target_soc,
+					 MIN_DISCHARGE_STEP_NS, now);
 	}
 
 	target_soc = clamp_t(int, bcdev->last_soc, 0, 100);
@@ -6691,6 +6744,7 @@ static int battery_chg_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&bcdev->boot_soc_work, battery_soc_boot_work);
 	bcdev->last_soc = -1;
 	bcdev->boot_highest_soc = -1;
+	bcdev->boot_counter_soc = -1;
 	init_completion(&bcdev->ack);
 	init_completion(&bcdev->fw_buf_ack);
 	init_completion(&bcdev->fw_update_ack);
