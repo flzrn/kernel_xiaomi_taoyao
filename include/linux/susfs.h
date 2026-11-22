@@ -48,6 +48,12 @@ struct st_susfs_sus_path_list {
 	struct st_susfs_sus_path                info;
 	char                                    target_pathname[SUSFS_MAX_LEN_PATHNAME];
 };
+
+/* sus_path uid filter */
+struct st_susfs_sus_path_uid_filter {
+	char                                    app_strings[SUSFS_APP_STR_BUF_SIZE];
+	int                                     err;
+};
 #endif
 
 /* sus_mount */
@@ -158,6 +164,14 @@ struct st_susfs_sus_map {
 	int                                     err;
 };
 #endif
+
+/* getpriority uid filter */
+#ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER
+struct st_susfs_priority_uid_filter {
+	char                                    app_strings[SUSFS_APP_STR_BUF_SIZE];
+	int                                     err;
+};
+#endif // #ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER
 
 /* avc log spoofing */
 struct st_susfs_avc_log_spoofing {
