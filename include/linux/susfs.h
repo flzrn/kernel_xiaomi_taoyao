@@ -245,6 +245,12 @@ void susfs_add_open_redirect(void __user **user_info);
 void susfs_add_sus_map(void __user **user_info);
 #endif
 
+/* getpriority uid filter */
+#ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER
+void susfs_set_priority_uid_filter(void __user **user_info);
+void susfs_parse_priority_app_strings(void);
+#endif // #ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER
+
 void susfs_set_avc_log_spoofing(void __user **user_info);
 
 void susfs_get_enabled_features(void __user **user_info);
