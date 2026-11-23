@@ -127,9 +127,11 @@ config KSU_SUSFS_PRIORITY_UID_FILTER
 	default n
 	help
 	  - Allow hiding user-defined uids from syscalls like getpriority/setpriority/ioprio_get/ioprio_set.
-	  - It may not be able to evade detections by apps that implement a good injection detection.
-	  - Effective only on zygote/zygote_next spawned user app process that is marked with TIF_PROC_UMOUNTED
-	    and with (uid % 100000) >= 10000.
+	  - Effective on all processes with uid >= 10000.
+
+	  Keep this disabled on taoyao: CONFIG_FGETPRIORITY already patches sys_getpriority
+	  (security/fgetpriority/, raw branch patch with kprobe fallback), so enabling both
+	  filters the same syscall twice and buys no additional hiding.
 
 config KSU_SUSFS_SPOOF_UNAME
 	bool "Enable to spoof uname"
