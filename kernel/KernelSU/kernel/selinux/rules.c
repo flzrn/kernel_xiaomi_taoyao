@@ -18,6 +18,7 @@
 #include "uapi/selinux.h"
 #include "klog.h" // IWYU pragma: keep
 #include "selinux.h"
+#include "feature/selinux_hide.h"
 #include "sepolicy.h"
 #include "ss/services.h"
 #include "linux/lsm_audit.h" // IWYU pragma: keep
@@ -203,6 +204,8 @@ static int apply_kernelsu_rules_fn(void *ptr)
     // Allow system server kill su process
     ksu_allow(db, "system_server", KERNEL_SU_DOMAIN, "process", "getpgid");
     ksu_allow(db, "system_server", KERNEL_SU_DOMAIN, "process", "sigkill");
+
+    ksu_selinux_hide_mark_policydb(db);
 
     return 0;
 }
@@ -713,6 +716,7 @@ static int handle_sepolicy_fn(void *data)
 	}
 
 out:
+	ksu_selinux_hide_mark_policydb(db);
 	*(int *)(ctx->ctx_success_cmd_count) = success_cmd_count;
 	return ret;
 }

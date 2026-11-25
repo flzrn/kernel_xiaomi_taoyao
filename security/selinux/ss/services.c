@@ -45,6 +45,7 @@
 #include <linux/errno.h>
 #include <linux/in.h>
 #include <linux/sched.h>
+#include <linux/cred.h>
 #include <linux/audit.h>
 #include <linux/mutex.h>
 #include <linux/vmalloc.h>
@@ -1396,7 +1397,8 @@ static int string_to_context_struct(struct policydb *pol,
 				    struct sidtab *sidtabp,
 				    char *scontext,
 				    struct context *ctx,
-				    u32 def_sid)
+				    u32 def_sid,
+				    bool hide_hidden)
 {
 	struct role_datum *role;
 	struct type_datum *typdatum;
@@ -1450,7 +1452,8 @@ static int string_to_context_struct(struct policydb *pol,
 	*p++ = 0;
 
 	typdatum = hashtab_search(pol->p_types.table, scontextp);
-	if (!typdatum || typdatum->attribute)
+	if (!typdatum || typdatum->attribute ||
+	    (hide_hidden && typdatum->hidden))
 		goto out;
 
 	ctx->type = typdatum->value;
@@ -1509,7 +1512,7 @@ static int context_struct_to_sid(struct selinux_state *state,
 static int security_context_to_sid_core(struct selinux_state *state,
 					const char *scontext, u32 scontext_len,
 					u32 *sid, u32 def_sid, gfp_t gfp_flags,
-					int force)
+					int force, bool user_hide)
 {
 	struct policydb *policydb;
 	struct sidtab *sidtab;
@@ -1518,6 +1521,9 @@ static int security_context_to_sid_core(struct selinux_state *state,
 	char *scontext2, *str = NULL;
 	struct context context;
 	int rc = 0;
+	bool hide_hidden = user_hide && !force &&
+			   ksu_selinux_hide_is_enabled() &&
+			   current_uid().val >= 10000;
 
 	/* An empty security context is never valid. */
 	if (!scontext_len)
@@ -1565,7 +1571,7 @@ static int security_context_to_sid_core(struct selinux_state *state,
 	policydb = &state->ss->policydb;
 	sidtab = state->ss->sidtab;
 	rc = string_to_context_struct(policydb, sidtab, scontext2,
-				      &context, def_sid);
+				      &context, def_sid, hide_hidden);
 	if (rc == -EINVAL && force) {
 		context.str = str;
 		context.len = scontext_len + 1;
@@ -1603,7 +1609,7 @@ int security_context_to_sid(struct selinux_state *state,
 			    gfp_t gfp)
 {
 	return security_context_to_sid_core(state, scontext, scontext_len,
-					    sid, SECSID_NULL, gfp, 0);
+					    sid, SECSID_NULL, gfp, 0, false);
 }
 
 int security_context_str_to_sid(struct selinux_state *state,
@@ -1611,6 +1617,21 @@ int security_context_str_to_sid(struct selinux_state *state,
 {
 	return security_context_to_sid(state, scontext, strlen(scontext),
 				       sid, gfp);
+}
+
+int security_context_to_sid_user(struct selinux_state *state,
+				 const char *scontext, u32 scontext_len,
+				 u32 *sid, gfp_t gfp)
+{
+	return security_context_to_sid_core(state, scontext, scontext_len,
+					    sid, SECSID_NULL, gfp, 0, true);
+}
+
+int security_context_str_to_sid_user(struct selinux_state *state,
+				     const char *scontext, u32 *sid, gfp_t gfp)
+{
+	return security_context_to_sid_user(state, scontext, strlen(scontext),
+					    sid, gfp);
 }
 
 /**
@@ -1636,7 +1657,7 @@ int security_context_to_sid_default(struct selinux_state *state,
 				    u32 *sid, u32 def_sid, gfp_t gfp_flags)
 {
 	return security_context_to_sid_core(state, scontext, scontext_len,
-					    sid, def_sid, gfp_flags, 1);
+					    sid, def_sid, gfp_flags, 1, false);
 }
 
 int security_context_to_sid_force(struct selinux_state *state,
@@ -1644,7 +1665,8 @@ int security_context_to_sid_force(struct selinux_state *state,
 				  u32 *sid)
 {
 	return security_context_to_sid_core(state, scontext, scontext_len,
-					    sid, SECSID_NULL, GFP_KERNEL, 1);
+					    sid, SECSID_NULL, GFP_KERNEL, 1,
+					    false);
 }
 
 static int compute_sid_handle_invalid_context(
@@ -2019,7 +2041,7 @@ static int convert_context(struct context *oldc, struct context *newc, void *p)
 			return -ENOMEM;
 
 		rc = string_to_context_struct(args->newp, NULL, s,
-					      newc, SECSID_NULL);
+					      newc, SECSID_NULL, false);
 		if (rc == -EINVAL) {
 			/*
 			 * Retain string representation for later mapping.
@@ -2219,6 +2241,7 @@ int security_load_policy(struct selinux_state *state, void *data, size_t len)
 
 		state->ss->sidtab = newsidtab;
 		security_load_policycaps(state);
+		ksu_selinux_hide_mark_policydb(policydb);
 		selinux_mark_initialized(state);
 		seqno = ++state->ss->latest_granting;
 		selinux_complete_init();
@@ -2285,6 +2308,8 @@ int security_load_policy(struct selinux_state *state, void *data, size_t len)
 
 	/* Save the old policydb and SID table to free later. */
 	memcpy(oldpolicydb, policydb, sizeof(*policydb));
+
+	ksu_selinux_hide_mark_policydb(newpolicydb);
 
 	/* Install the new policydb and SID table. */
 	write_lock_irq(&state->ss->policy_rwlock);

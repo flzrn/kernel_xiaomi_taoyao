@@ -1,6 +1,7 @@
 #include <linux/fs.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/namei.h>
 #include <linux/uaccess.h>
 #include <linux/cred.h>
@@ -17,6 +18,7 @@
 #include "ksu.h"
 #include "uapi/feature.h"
 #include "selinux/selinux.h"
+#include "ss/services.h"
 #include "feature/selinux_hide.h"
 #include "compat/kernel_compat.h"
 
@@ -30,13 +32,6 @@ extern struct selinux_state selinux_state;
 #else
 #define KSU_HAS_SELINUX_STATE 0
 #endif
-
-#ifndef SIMPLE_TRANSACTION_LIMIT
-#define SIMPLE_TRANSACTION_LIMIT (PAGE_SIZE - 1)
-#endif
-
-#define KSU_SEL_CONTEXT_INO 5
-#define KSU_SEL_ACCESS_INO  6
 
 static bool ksu_selinux_hide_enabled __read_mostly = true;
 
@@ -53,8 +48,43 @@ static void ksu_rcu_replace(struct ksu_hide_buf __rcu **slot, struct ksu_hide_bu
 {
     struct ksu_hide_buf *old = rcu_dereference_protected(*slot, 1);
     rcu_assign_pointer(*slot, new_buf);
-    synchronize_rcu();
-    kfree(old);
+    if (old) {
+        synchronize_rcu();
+        kfree(old);
+    }
+}
+
+void ksu_selinux_hide_mark_policydb(struct policydb *db)
+{
+    struct ksu_hide_buf *buf;
+    size_t off;
+
+    if (!db)
+        return;
+
+    rcu_read_lock();
+    buf = rcu_dereference(ksu_hide_type_list);
+    if (buf) {
+        size_t len = buf->len;
+        off = 0;
+        while (off < len) {
+            const char *entry = buf->data + off;
+            size_t elen = strlen(entry);
+
+            if (elen >= 3 && elen - 2 < 128) {
+                char tname[128];
+                struct type_datum *typdatum;
+
+                memcpy(tname, entry + 1, elen - 2);
+                tname[elen - 2] = '\0';
+                typdatum = hashtab_search(db->p_types.table, tname);
+                if (typdatum)
+                    typdatum->hidden = 1;
+            }
+            off += elen + 1;
+        }
+    }
+    rcu_read_unlock();
 }
 
 void ksu_selinux_hide_add_type(const char *name)
@@ -91,6 +121,14 @@ void ksu_selinux_hide_add_type(const char *name)
 
     ksu_rcu_replace(&ksu_hide_type_list, new_buf);
     pr_info_ratelimited("selinux_hide: track type: :%s:\n", name);
+
+#if KSU_HAS_SELINUX_STATE
+    if (selinux_initialized(&selinux_state)) {
+        write_lock_irq(&selinux_state.ss->policy_rwlock);
+        ksu_selinux_hide_mark_policydb(&selinux_state.ss->policydb);
+        write_unlock_irq(&selinux_state.ss->policy_rwlock);
+    }
+#endif
 
 out:
     mutex_unlock(&ksu_hide_list_mutex);
@@ -145,50 +183,9 @@ out:
     mutex_unlock(&ksu_hide_list_mutex);
 }
 
-static bool ksu_should_hide_context(const char *str)
+bool ksu_selinux_hide_is_enabled(void)
 {
-    struct ksu_hide_buf *buf;
-    size_t off;
-
-    if (!str)
-        return false;
-
-    rcu_read_lock();
-
-    buf = rcu_dereference(ksu_hide_type_list);
-    if (buf) {
-        size_t len = buf->len;
-        off = 0;
-        while (off < len) {
-            const char *entry = buf->data + off;
-            if (strstr(str, entry)) {
-                rcu_read_unlock();
-                return true;
-            }
-            off += strlen(entry) + 1;
-        }
-    }
-
-    buf = rcu_dereference(ksu_hide_rule_list);
-    if (buf) {
-        size_t len = buf->len;
-        off = 0;
-        while (off < len) {
-            const char *src = buf->data + off;
-            size_t ssz = strlen(src) + 1;
-            const char *tgt = src + ssz;
-            size_t tsz = strlen(tgt) + 1;
-
-            if (strstr(str, src) && strstr(str, tgt)) {
-                rcu_read_unlock();
-                return true;
-            }
-            off += ssz + tsz;
-        }
-    }
-
-    rcu_read_unlock();
-    return false;
+    return READ_ONCE(ksu_selinux_hide_enabled);
 }
 
 struct ksu_dirty_rule {
@@ -220,37 +217,22 @@ static bool ksu_is_dirty_access_query(const char *scon, const char *tcon)
     return false;
 }
 
-static void ksu_fix_access_response(void *private_data, bool deny)
+void ksu_selinux_hide_filter_access(const char *scon, const char *tcon,
+                                    struct av_decision *avd)
 {
-    struct simple_transaction_argresp *ar = private_data;
-    unsigned int allowed, ff, auditallow, auditdeny, flags, seqno;
-    char buf[64];
-    int len;
-
-    if (!ar)
+    if (unlikely(!ksu_selinux_hide_is_enabled()))
+        return;
+    if (current_uid().val < 10000)
         return;
 
-    if (sscanf(ar->data, "%x %x %x %x %u %x",
-               &allowed, &ff, &auditallow, &auditdeny, &seqno, &flags) != 6)
-        return;
-
-    if (deny) {
-        allowed    = 0;
-        auditallow = 0;
-        auditdeny  = 0xffffffff;
-        flags      = 0;
+    if (scon && tcon && ksu_is_dirty_access_query(scon, tcon)) {
+        avd->allowed = 0;
+        avd->auditallow = 0;
+        avd->auditdeny = 0xffffffff;
+        avd->flags = 0;
     }
 
-    seqno = 1;
-
-    len = scnprintf(buf, sizeof(buf), "%x %x %x %x %u %x",
-                    allowed, 0xffffffff, auditallow, auditdeny, seqno, flags);
-
-    if (len > 0 && len < (int)SIMPLE_TRANSACTION_LIMIT) {
-        memcpy(ar->data, buf, len);
-        ar->data[len] = '\0';
-        ar->size = len;
-    }
+    avd->seqno = 1;
 }
 
 static int ksu_patch_fops_slot(void **slot, void *new_fn)
@@ -285,130 +267,6 @@ static struct file_operations *ksu_resolve_fops(const char *path_str)
         fops = (struct file_operations *)d_inode(path.dentry)->i_fop;
     path_put(&path);
     return fops;
-}
-
-static ssize_t (*orig_sel_write)(struct file *, const char __user *, size_t, loff_t *);
-static struct file_operations *g_sel_context_fops;
-
-static __nocfi ssize_t ksu_sel_write(struct file *file, const char __user *ubuf, size_t size, loff_t *pos)
-{
-    ino_t ino;
-    char kbuf[256];
-    size_t len;
-    ssize_t ret;
-
-    if (unlikely(!ksu_selinux_hide_enabled))
-        goto passthrough;
-    if (current_uid().val < 10000)
-        goto passthrough;
-
-    ino = file_inode(file)->i_ino;
-    if (ino != KSU_SEL_CONTEXT_INO && ino != KSU_SEL_ACCESS_INO)
-        goto passthrough;
-
-    len = size < sizeof(kbuf) - 1 ? size : sizeof(kbuf) - 1;
-    if (copy_from_user(kbuf, ubuf, len))
-        goto passthrough;
-    kbuf[len] = 0;
-
-    if (ksu_should_hide_context(kbuf)) {
-        pr_info_ratelimited("selinux_hide: blocked context (ino %lu): %.40s\n", (unsigned long)ino, kbuf);
-        return -EINVAL;
-    }
-
-    if (ino == KSU_SEL_CONTEXT_INO)
-        goto passthrough;
-
-    ret = orig_sel_write(file, ubuf, size, pos);
-    if (ret <= 0)
-        return ret;
-
-    {
-        bool deny = false;
-        char scon[128], tcon[128];
-        unsigned int tclass_num;
-
-        if (sscanf(kbuf, "%127s %127s %u", scon, tcon, &tclass_num) == 3 &&
-            ksu_is_dirty_access_query(scon, tcon))
-            deny = true;
-
-        ksu_fix_access_response(file->private_data, deny);
-    }
-
-    return ret;
-
-passthrough:
-    return orig_sel_write(file, ubuf, size, pos);
-}
-
-static ssize_t (*orig_proc_pid_attr_write)(struct file *, const char __user *, size_t, loff_t *) __read_mostly;
-static struct file_operations *g_proc_attr_fops;
-
-static __nocfi ssize_t ksu_proc_pid_attr_write(struct file *file, const char __user *ubuf, size_t size, loff_t *pos)
-{
-    char kbuf[128];
-    size_t len;
-    const char *attr_name;
-
-    if (unlikely(!ksu_selinux_hide_enabled))
-        goto passthrough;
-    if (current_uid().val < 10000)
-        goto passthrough;
-
-    attr_name = file->f_path.dentry->d_name.name;
-    if (!attr_name || strcmp(attr_name, "current"))
-        goto passthrough;
-
-    len = size < sizeof(kbuf) - 1 ? size : sizeof(kbuf) - 1;
-    if (copy_from_user(kbuf, ubuf, len))
-        goto passthrough;
-    kbuf[len] = '\0';
-
-    if (ksu_should_hide_context(kbuf)) {
-        pr_info_ratelimited("selinux_hide: attr/current blocked: %.40s\n", kbuf);
-        return -EINVAL;
-    }
-
-passthrough:
-    return orig_proc_pid_attr_write(file, ubuf, size, pos);
-}
-
-static void ksu_hook_proc_attr_write(void)
-{
-    struct file_operations *fops;
-    int ret;
-
-    if (orig_proc_pid_attr_write)
-        return;
-
-    fops = ksu_resolve_fops("/proc/self/attr/current");
-    if (!fops || !fops->write)
-        return;
-
-    g_proc_attr_fops = fops;
-    orig_proc_pid_attr_write = fops->write;
-    ret = ksu_patch_fops_slot((void **)&fops->write, ksu_proc_pid_attr_write);
-    if (ret)
-        pr_warn("selinux_hide: proc_attr hook failed: %d\n", ret);
-}
-
-static void ksu_hook_transaction_write(void)
-{
-    struct file_operations *fops;
-    int ret;
-
-    if (orig_sel_write)
-        return;
-
-    fops = ksu_resolve_fops("/sys/fs/selinux/context");
-    if (!fops || !fops->write)
-        return;
-
-    g_sel_context_fops = fops;
-    orig_sel_write = fops->write;
-    ret = ksu_patch_fops_slot((void **)&fops->write, ksu_sel_write);
-    if (ret)
-        pr_warn("selinux_hide: patch write failed: %d\n", ret);
 }
 
 static struct page *ksu_fake_status_page __read_mostly = NULL;
@@ -460,7 +318,7 @@ static int ksu_prepare_fake_status_page(void)
 
 static __nocfi int ksu_status_open(struct inode *inode, struct file *filp)
 {
-    if (likely(ksu_selinux_hide_enabled && current_uid().val >= 10000)) {
+    if (likely(ksu_selinux_hide_is_enabled() && current_uid().val >= 10000)) {
         struct page *fp = smp_load_acquire(&ksu_fake_status_page);
         if (fp) {
             filp->private_data = fp;
@@ -491,14 +349,14 @@ static void ksu_hook_status_open(void)
 
 static int selinux_hide_get(u64 *v)
 {
-    *v = ksu_selinux_hide_enabled ? 1 : 0;
+    *v = ksu_selinux_hide_is_enabled() ? 1 : 0;
     return 0;
 }
 
 static int selinux_hide_set(u64 v)
 {
-    ksu_selinux_hide_enabled = !!v;
-    pr_info_ratelimited("selinux_hide: enabled=%d\n", ksu_selinux_hide_enabled);
+    WRITE_ONCE(ksu_selinux_hide_enabled, !!v);
+    pr_info_ratelimited("selinux_hide: enabled=%d\n", ksu_selinux_hide_is_enabled());
     return 0;
 }
 
@@ -509,12 +367,8 @@ static const struct ksu_feature_handler selinux_hide_handler = {
     .set_handler = selinux_hide_set,
 };
 
-static int ksu_selinux_hide_init_thread(void *data)
+static void __init ksu_selinux_hide_register_defaults(void)
 {
-    int tries = 0;
-
-    set_user_nice(current, 19);
-
     ksu_selinux_hide_add_type(KERNEL_SU_DOMAIN);
     ksu_selinux_hide_add_type(KERNEL_SU_FILE);
     ksu_selinux_hide_add_rule(KERNEL_SU_DOMAIN, KERNEL_SU_FILE);
@@ -528,19 +382,22 @@ static int ksu_selinux_hide_init_thread(void *data)
     ksu_selinux_hide_add_type("adbroot");
     ksu_selinux_hide_add_type("msd_app");
     ksu_selinux_hide_add_type("msd_daemon");
+}
+
+static int ksu_selinux_hide_init_thread(void *data)
+{
+    int tries = 0;
+
+    set_user_nice(current, 19);
 
 try_again:
     if (ksu_prepare_fake_status_page()) {
         if (++tries > 10)
-            goto skip_status;
+            return 0;
         msleep(1000);
         goto try_again;
     }
     ksu_hook_status_open();
-
-skip_status:
-    ksu_hook_transaction_write();
-    ksu_hook_proc_attr_write();
     return 0;
 }
 
@@ -549,8 +406,6 @@ void ksu_selinux_hide_handle_second_stage(void)
     if (!READ_ONCE(ksu_fake_status_page))
         ksu_prepare_fake_status_page();
     ksu_hook_status_open();
-    ksu_hook_transaction_write();
-    ksu_hook_proc_attr_write();
 }
 
 void ksu_selinux_hide_handle_post_fs_data(void)
@@ -558,8 +413,6 @@ void ksu_selinux_hide_handle_post_fs_data(void)
     if (!READ_ONCE(ksu_fake_status_page))
         ksu_prepare_fake_status_page();
     ksu_hook_status_open();
-    ksu_hook_transaction_write();
-    ksu_hook_proc_attr_write();
 }
 
 void __init ksu_selinux_hide_init(void)
@@ -567,6 +420,7 @@ void __init ksu_selinux_hide_init(void)
     if (ksu_register_feature_handler(&selinux_hide_handler))
         pr_err("selinux_hide: register feature failed\n");
 
+    ksu_selinux_hide_register_defaults();
     kthread_run(ksu_selinux_hide_init_thread, NULL, "ksu_selinux_hide");
 }
 
@@ -579,12 +433,6 @@ void __exit ksu_selinux_hide_exit(void)
     ksu_rcu_replace(&ksu_hide_rule_list, NULL);
     mutex_unlock(&ksu_hide_list_mutex);
 
-    if (g_sel_context_fops && orig_sel_write)
-        ksu_patch_fops_slot((void **)&g_sel_context_fops->write, orig_sel_write);
     if (g_status_fops && orig_status_open)
         ksu_patch_fops_slot((void **)&g_status_fops->open, orig_status_open);
-    if (g_proc_attr_fops && orig_proc_pid_attr_write) {
-        ksu_patch_fops_slot((void **)&g_proc_attr_fops->write, orig_proc_pid_attr_write);
-        orig_proc_pid_attr_write = NULL;
-    }
 }

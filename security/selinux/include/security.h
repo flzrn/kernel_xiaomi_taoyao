@@ -314,6 +314,29 @@ int security_context_to_sid(struct selinux_state *state,
 int security_context_str_to_sid(struct selinux_state *state,
 				const char *scontext, u32 *out_sid, gfp_t gfp);
 
+int security_context_to_sid_user(struct selinux_state *state,
+				 const char *scontext, u32 scontext_len,
+				 u32 *out_sid, gfp_t gfp);
+
+int security_context_str_to_sid_user(struct selinux_state *state,
+				     const char *scontext, u32 *out_sid,
+				     gfp_t gfp);
+
+struct policydb;
+
+#ifdef CONFIG_KSU
+bool ksu_selinux_hide_is_enabled(void);
+void ksu_selinux_hide_mark_policydb(struct policydb *db);
+void ksu_selinux_hide_filter_access(const char *scon, const char *tcon,
+				    struct av_decision *avd);
+#else
+static inline bool ksu_selinux_hide_is_enabled(void) { return false; }
+static inline void ksu_selinux_hide_mark_policydb(struct policydb *db) {}
+static inline void ksu_selinux_hide_filter_access(const char *scon,
+						  const char *tcon,
+						  struct av_decision *avd) {}
+#endif
+
 int security_context_to_sid_default(struct selinux_state *state,
 				    const char *scontext, u32 scontext_len,
 				    u32 *out_sid, u32 def_sid, gfp_t gfp_flags);

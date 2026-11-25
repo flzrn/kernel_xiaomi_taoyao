@@ -111,6 +111,7 @@ struct type_datum {
 	u32 bounds;		/* boundary of type */
 	unsigned char primary;	/* primary name? */
 	unsigned char attribute;/* attribute ?*/
+	unsigned char hidden;	/* hidden from unprivileged userspace lookup */
 };
 
 /* User attributes */

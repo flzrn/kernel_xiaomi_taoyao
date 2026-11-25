@@ -613,7 +613,7 @@ static ssize_t sel_write_context(struct file *file, char *buf, size_t size)
 	if (length)
 		goto out;
 
-	length = security_context_to_sid(state, buf, size, &sid, GFP_KERNEL);
+	length = security_context_to_sid_user(state, buf, size, &sid, GFP_KERNEL);
 	if (length)
 		goto out;
 
@@ -739,15 +739,15 @@ static ssize_t sel_write_validatetrans(struct file *file,
 	if (sscanf(req, "%s %s %hu %s", oldcon, newcon, &tclass, taskcon) != 4)
 		goto out;
 
-	rc = security_context_str_to_sid(state, oldcon, &osid, GFP_KERNEL);
+	rc = security_context_str_to_sid_user(state, oldcon, &osid, GFP_KERNEL);
 	if (rc)
 		goto out;
 
-	rc = security_context_str_to_sid(state, newcon, &nsid, GFP_KERNEL);
+	rc = security_context_str_to_sid_user(state, newcon, &nsid, GFP_KERNEL);
 	if (rc)
 		goto out;
 
-	rc = security_context_str_to_sid(state, taskcon, &tsid, GFP_KERNEL);
+	rc = security_context_str_to_sid_user(state, taskcon, &tsid, GFP_KERNEL);
 	if (rc)
 		goto out;
 
@@ -849,11 +849,11 @@ static ssize_t sel_write_access(struct file *file, char *buf, size_t size)
 	if (sscanf(buf, "%s %s %hu", scon, tcon, &tclass) != 3)
 		goto out;
 
-	length = security_context_str_to_sid(state, scon, &ssid, GFP_KERNEL);
+	length = security_context_str_to_sid_user(state, scon, &ssid, GFP_KERNEL);
 	if (length)
 		goto out;
 
-	length = security_context_str_to_sid(state, tcon, &tsid, GFP_KERNEL);
+	length = security_context_str_to_sid_user(state, tcon, &tsid, GFP_KERNEL);
 	if (length)
 		goto out;
 
@@ -865,6 +865,7 @@ static ssize_t sel_write_access(struct file *file, char *buf, size_t size)
 			avd.allowed &= ~FILE__EXECUTE_NO_TRANS;
 		if (strstr(scon, "fsck_untrusted"))
 			avd.allowed &= ~CAPABILITY__SYS_ADMIN;
+		ksu_selinux_hide_filter_access(scon, tcon, &avd);
 	}
 
 	length = scnprintf(buf, SIMPLE_TRANSACTION_LIMIT,
@@ -948,11 +949,11 @@ static ssize_t sel_write_create(struct file *file, char *buf, size_t size)
 		objname = namebuf;
 	}
 
-	length = security_context_str_to_sid(state, scon, &ssid, GFP_KERNEL);
+	length = security_context_str_to_sid_user(state, scon, &ssid, GFP_KERNEL);
 	if (length)
 		goto out;
 
-	length = security_context_str_to_sid(state, tcon, &tsid, GFP_KERNEL);
+	length = security_context_str_to_sid_user(state, tcon, &tsid, GFP_KERNEL);
 	if (length)
 		goto out;
 
@@ -1014,11 +1015,11 @@ static ssize_t sel_write_relabel(struct file *file, char *buf, size_t size)
 	if (sscanf(buf, "%s %s %hu", scon, tcon, &tclass) != 3)
 		goto out;
 
-	length = security_context_str_to_sid(state, scon, &ssid, GFP_KERNEL);
+	length = security_context_str_to_sid_user(state, scon, &ssid, GFP_KERNEL);
 	if (length)
 		goto out;
 
-	length = security_context_str_to_sid(state, tcon, &tsid, GFP_KERNEL);
+	length = security_context_str_to_sid_user(state, tcon, &tsid, GFP_KERNEL);
 	if (length)
 		goto out;
 
@@ -1075,7 +1076,7 @@ static ssize_t sel_write_user(struct file *file, char *buf, size_t size)
 	if (sscanf(buf, "%s %s", con, user) != 2)
 		goto out;
 
-	length = security_context_str_to_sid(state, con, &sid, GFP_KERNEL);
+	length = security_context_str_to_sid_user(state, con, &sid, GFP_KERNEL);
 	if (length)
 		goto out;
 
@@ -1140,11 +1141,11 @@ static ssize_t sel_write_member(struct file *file, char *buf, size_t size)
 	if (sscanf(buf, "%s %s %hu", scon, tcon, &tclass) != 3)
 		goto out;
 
-	length = security_context_str_to_sid(state, scon, &ssid, GFP_KERNEL);
+	length = security_context_str_to_sid_user(state, scon, &ssid, GFP_KERNEL);
 	if (length)
 		goto out;
 
-	length = security_context_str_to_sid(state, tcon, &tsid, GFP_KERNEL);
+	length = security_context_str_to_sid_user(state, tcon, &tsid, GFP_KERNEL);
 	if (length)
 		goto out;
 
