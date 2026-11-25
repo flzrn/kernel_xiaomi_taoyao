@@ -1873,23 +1873,25 @@ static struct power_supply_desc usb_psy_desc = {
 static int __battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 					u32 fcc_ua)
 {
-	int rc;
-
+	/*
+	 * On the taoyao/SM7325 platform the ADSP uses BATT_CHG_CTRL_LIM as a
+	 * thermal-level index register, not a microamp register.  Writing a uA
+	 * value here is always rejected by the ADSP (non-zero ret_code), which
+	 * is now surfaced as an error through the resp_ret path introduced in
+	 * 045700ddf.  The actual hardware current ceiling is set by the
+	 * index-based battery_psy_set_charge_current() path that the thermal
+	 * framework drives; this function's role is purely software: it clamps
+	 * the effective FCC seen by that path and records last_fcc_ua.
+	 */
 	if (bcdev->restrict_chg_en) {
 		fcc_ua = min_t(u32, fcc_ua, bcdev->restrict_fcc_ua);
 		fcc_ua = min_t(u32, fcc_ua, bcdev->thermal_fcc_ua);
 	}
 
-	rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_BATTERY],
-				BATT_CHG_CTRL_LIM, fcc_ua);
-	if (rc < 0) {
-		pr_err("Failed to set FCC %u, rc=%d\n", fcc_ua, rc);
-	} else {
-		pr_debug("Set FCC to %u uA\n", fcc_ua);
-		bcdev->last_fcc_ua = fcc_ua;
-	}
-
-	return rc;
+	pr_debug("FCC gate: %u uA (restrict_chg_en=%d restrict_fcc_ua=%u)\n",
+		 fcc_ua, bcdev->restrict_chg_en, bcdev->restrict_fcc_ua);
+	bcdev->last_fcc_ua = fcc_ua;
+	return 0;
 }
 
 static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
@@ -1913,6 +1915,35 @@ static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 
 	if (val < 0 || val >= bcdev->num_thermal_levels)
 		return -EINVAL;
+
+	/*
+	 * Honour the software FCC gate set by charging_enabled / restrict_chg /
+	 * restrict_cur sysfs nodes.  When restrict_chg_en is set (charging
+	 * disabled) block the index write; when restrict_fcc_ua caps the allowed
+	 * current, clamp the requested level to the nearest index whose current
+	 * does not exceed the cap.
+	 */
+	if (bcdev->restrict_chg_en) {
+		if (!bcdev->restrict_fcc_ua) {
+			/* Charging explicitly disabled – skip the ADSP write. */
+			pr_debug("FCC gate: charging disabled, skipping level %d\n", val);
+			bcdev->curr_thermal_level = val;
+			return 0;
+		}
+		/* Clamp to the highest level whose current fits the cap. */
+		if (bcdev->thermal_levels && bcdev->thermal_levels[val] >
+		    bcdev->restrict_fcc_ua) {
+			int i;
+
+			for (i = val + 1; i < bcdev->num_thermal_levels; i++) {
+				if (bcdev->thermal_levels[i] <=
+				    bcdev->restrict_fcc_ua) {
+					val = i;
+					break;
+				}
+			}
+		}
+	}
 
 	rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_BATTERY],
 				BATT_CHG_CTRL_LIM, val);
