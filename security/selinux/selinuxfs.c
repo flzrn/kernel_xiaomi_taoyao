@@ -859,12 +859,24 @@ static ssize_t sel_write_access(struct file *file, char *buf, size_t size)
 
 	security_compute_av_user(state, ssid, tsid, tclass, &avd);
 
-	/* Mask out non-stock dynamic rules queried by DirtySepolicy probes */
+	/*
+	 * Mask out non-stock dynamic rules queried by DirtySepolicy probes.
+	 *
+	 * Only app uids are masked. Root/system callers legitimately use these
+	 * same two queries as canaries for whether the policy they shipped is
+	 * actually loaded (e.g. LSPosed/Vector probes dex2oat ->
+	 * dex2oat_exec:file execute_no_trans as the first line of its
+	 * sepolicy.rule); masking them unconditionally makes such callers
+	 * conclude the policy was never applied. ksu_selinux_hide_filter_access()
+	 * applies the same uid gate.
+	 */
 	if (scon && tcon) {
-		if (strstr(scon, "dex2oat") && strstr(tcon, "dex2oat_exec"))
-			avd.allowed &= ~FILE__EXECUTE_NO_TRANS;
-		if (strstr(scon, "fsck_untrusted"))
-			avd.allowed &= ~CAPABILITY__SYS_ADMIN;
+		if (current_uid().val >= 10000) {
+			if (strstr(scon, "dex2oat") && strstr(tcon, "dex2oat_exec"))
+				avd.allowed &= ~FILE__EXECUTE_NO_TRANS;
+			if (strstr(scon, "fsck_untrusted"))
+				avd.allowed &= ~CAPABILITY__SYS_ADMIN;
+		}
 		ksu_selinux_hide_filter_access(scon, tcon, &avd);
 	}
 
