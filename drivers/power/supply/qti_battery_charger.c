@@ -2022,6 +2022,8 @@ static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 /* Power-on placeholders of the ADSP battery channel. */
 #define SOC_PLACEHOLDER_UV	3700000
 #define SOC_PLACEHOLDER_TEMP	500	/* 50.0 degC in 0.1 degC */
+#define SOC_PLACEHOLDER_FULL	4500000
+#define SOC_PLACEHOLDER_COUNTER	4600000
 /*
  * Provisional level published while the gauge is not ready: above the 15%
  * low-battery warning and far from the 1% shutdown path, yet low enough that it
@@ -2126,18 +2128,77 @@ static s64 battery_soc_poll_ns(struct battery_chg_dev *bcdev)
 }
 
 /*
+ * Rate-limit GLINK counter polls (1s while starting, 5s steady-state) and
+ * refresh charge_full until settled or whenever empty/placeholder values could
+ * hide an ADSP fail-safe reset or mask the pack's real learned capacity.
+ */
+static void battery_soc_refresh_counters(struct battery_chg_dev *bcdev,
+					 struct psy_state *pst, s64 now,
+					 u32 *charge_full,
+					 u32 *charge_counter)
+{
+	bool polled = false;
+	u32 raw_full;
+	int rc;
+
+	if (!bcdev->last_counter_query_ns ||
+	    (now - bcdev->last_counter_query_ns >= battery_soc_poll_ns(bcdev))) {
+		polled = true;
+		rc = read_property_id(bcdev, pst, BATT_CHG_COUNTER);
+		if (rc >= 0) {
+			bcdev->last_counter_query_ns = now;
+			bcdev->cached_charge_counter = pst->prop[BATT_CHG_COUNTER];
+		} else if (bcdev->last_counter_query_ns) {
+			bcdev->last_counter_query_ns = now;
+		}
+	}
+	*charge_counter = bcdev->last_counter_query_ns ?
+			  bcdev->cached_charge_counter : pst->prop[BATT_CHG_COUNTER];
+
+	if (!bcdev->cached_charge_full ||
+	    (polled && (!bcdev->boot_stabilized || bcdev->boot_provisional ||
+			bcdev->failsafe_recovering || *charge_counter == 0 ||
+			*charge_counter == SOC_PLACEHOLDER_COUNTER ||
+			bcdev->cached_charge_full == SOC_PLACEHOLDER_FULL))) {
+		rc = read_property_id(bcdev, pst, BATT_CHG_FULL);
+		if (rc >= 0) {
+			raw_full = pst->prop[BATT_CHG_FULL];
+			if (raw_full == 0)
+				bcdev->cached_charge_full = 0;
+			else if (!(raw_full == SOC_PLACEHOLDER_FULL &&
+				   *charge_counter == SOC_PLACEHOLDER_COUNTER))
+				bcdev->cached_charge_full = raw_full;
+		}
+	}
+
+	raw_full = pst->prop[BATT_CHG_FULL];
+	if (raw_full == SOC_PLACEHOLDER_FULL &&
+	    *charge_counter == SOC_PLACEHOLDER_COUNTER)
+		*charge_full = raw_full;
+	else
+		*charge_full = bcdev->cached_charge_full ?
+			       bcdev->cached_charge_full : raw_full;
+}
+
+/*
  * True when the battery channel is still answering with its power-on
- * placeholders: an unseeded counter plus the fixed 3.700 V. Temperature is a
- * second confirmation when the ADSP answers it, so a real 3.700 V reading on a
- * nearly empty pack (normal temperature) is still treated as a measurement.
+ * placeholders: an unseeded counter (or 4500/4600 mAh dummy tuple) plus the
+ * fixed 3.700 V. Temperature is a second confirmation when the ADSP answers it,
+ * so a real 3.700 V reading on a nearly empty pack (normal temperature) is
+ * still treated as a measurement.
  */
 static bool battery_gauge_not_ready(struct battery_chg_dev *bcdev,
-				    struct psy_state *pst, u32 charge_counter)
+				    struct psy_state *pst, u32 charge_full,
+				    u32 charge_counter)
 {
+	bool counter_placeholder;
 	u32 temp;
 
-	if (!battery_counter_unusable(bcdev->cached_charge_full,
-				      charge_counter))
+	counter_placeholder =
+		battery_counter_unusable(charge_full, charge_counter) ||
+		(charge_full == SOC_PLACEHOLDER_FULL &&
+		 charge_counter == SOC_PLACEHOLDER_COUNTER);
+	if (!counter_placeholder)
 		return false;
 
 	if (read_property_id(bcdev, pst, BATT_VOLT_NOW) < 0)
@@ -2195,8 +2256,8 @@ static int battery_soc_from_voltage(u32 uv)
  */
 static int battery_soc_boot_guard(struct battery_chg_dev *bcdev,
 				  struct psy_state *pst, int soc,
-				  u32 charge_counter, bool is_charging,
-				  s64 now, bool *guarded)
+				  u32 charge_full, u32 charge_counter,
+				  bool is_charging, s64 now, bool *guarded)
 {
 	u32 uv, guard_uv;
 	int vsoc;
@@ -2211,7 +2272,7 @@ static int battery_soc_boot_guard(struct battery_chg_dev *bcdev,
 	 * 41.99%), so it carries no level. Publish a provisional mid value and
 	 * keep the boot window open so the first real measurement replaces it.
 	 */
-	if (battery_gauge_not_ready(bcdev, pst, charge_counter)) {
+	if (battery_gauge_not_ready(bcdev, pst, charge_full, charge_counter)) {
 		bcdev->gauge_not_ready = true;
 		*guarded = true;
 
@@ -2227,11 +2288,12 @@ static int battery_soc_boot_guard(struct battery_chg_dev *bcdev,
 
 	/*
 	 * On a charger in steady state a low reading is plausible; do not
-	 * second-guess it. During early boot, however, the ADSP can report 1%
-	 * while VBAT/temp are already real (bypassing the placeholder triple);
-	 * keep guarding suspect <= 5% readings until boot stabilizes.
+	 * second-guess it. During early boot or while still holding a
+	 * provisional pre-plug-in latch, however, the ADSP can report 1% while
+	 * VBAT/temp are already real; keep guarding suspect <= 5% readings
+	 * until real telemetry replaces the provisional latch.
 	 */
-	if (is_charging && bcdev->boot_stabilized)
+	if (is_charging && bcdev->boot_stabilized && !bcdev->boot_provisional)
 		return soc;
 
 	/* Refresh voltage instead of trusting a stale cached value. */
@@ -2371,25 +2433,8 @@ static void battery_soc_boot_work(struct work_struct *work)
 	now = ktime_get_boottime_ns();
 	was_not_ready = bcdev->gauge_not_ready;
 
-	if (!bcdev->cached_charge_full) {
-		rc = read_property_id(bcdev, pst, BATT_CHG_FULL);
-		if (rc >= 0 && pst->prop[BATT_CHG_FULL] > 0)
-			bcdev->cached_charge_full = pst->prop[BATT_CHG_FULL];
-	}
-	charge_full = bcdev->cached_charge_full ? bcdev->cached_charge_full : pst->prop[BATT_CHG_FULL];
-
-	/* 2. Rate-limit reading real-time charge_counter over GLINK (at most once every 5s) */
-	if (!bcdev->last_counter_query_ns ||
-	    (now - bcdev->last_counter_query_ns >= battery_soc_poll_ns(bcdev))) {
-		rc = read_property_id(bcdev, pst, BATT_CHG_COUNTER);
-		if (rc >= 0) {
-			bcdev->last_counter_query_ns = now;
-			bcdev->cached_charge_counter = pst->prop[BATT_CHG_COUNTER];
-		} else if (bcdev->last_counter_query_ns) {
-			bcdev->last_counter_query_ns = now;
-		}
-	}
-	charge_counter = bcdev->last_counter_query_ns ? bcdev->cached_charge_counter : pst->prop[BATT_CHG_COUNTER];
+	battery_soc_refresh_counters(bcdev, pst, now, &charge_full,
+				     &charge_counter);
 
 	/* 3. Rate-limit reading BATT_CAPACITY over GLINK (at most once every 5s) */
 	if (!bcdev->last_capacity_query_ns ||
@@ -2454,8 +2499,8 @@ static void battery_soc_boot_work(struct work_struct *work)
 	target_soc = battery_soc_blend(raw_soc, fallback_soc);
 
 	target_soc = battery_soc_boot_guard(bcdev, pst, target_soc,
-					    charge_counter, is_charging,
-					    now, &guarded);
+					    charge_full, charge_counter,
+					    is_charging, now, &guarded);
 
 	spin_lock_irqsave(&bcdev->soc_lock, flags);
 	if (bcdev->boot_stabilized) {
@@ -2573,7 +2618,7 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 					      int fallback_soc)
 {
 	u32 charge_full, charge_counter, max_valid_counter;
-	int rc, raw_soc, target_soc;
+	int raw_soc, target_soc;
 	bool is_charging, is_failsafe_100, is_failsafe_low, gauge_failsafe;
 	bool is_failsafe_chg, recovered = false, guarded = false;
 	unsigned long flags;
@@ -2587,30 +2632,8 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 
 	now = ktime_get_boottime_ns();
 
-	/* 1. Read or use cached charge_full once to eliminate redundant GLINK traffic */
-	if (!bcdev->cached_charge_full) {
-		rc = read_property_id(bcdev, pst, BATT_CHG_FULL);
-		if (rc >= 0 && pst->prop[BATT_CHG_FULL] > 0)
-			bcdev->cached_charge_full = pst->prop[BATT_CHG_FULL];
-	}
-	charge_full = bcdev->cached_charge_full ? bcdev->cached_charge_full : pst->prop[BATT_CHG_FULL];
-
-	/* 2. Rate-limit reading real-time charge_counter over GLINK.
-	 * Polling GLINK on every single capacity read starves USB-PD / charger
-	 * handshake, causing USB disconnect/reconnect loops (spam reconnect).
-	 * Only query GLINK at most once every COUNTER_REFRESH_NS (5s).
-	 */
-	if (!bcdev->last_counter_query_ns ||
-	    (now - bcdev->last_counter_query_ns >= battery_soc_poll_ns(bcdev))) {
-		rc = read_property_id(bcdev, pst, BATT_CHG_COUNTER);
-		if (rc >= 0) {
-			bcdev->last_counter_query_ns = now;
-			bcdev->cached_charge_counter = pst->prop[BATT_CHG_COUNTER];
-		} else if (bcdev->last_counter_query_ns) {
-			bcdev->last_counter_query_ns = now;
-		}
-	}
-	charge_counter = bcdev->last_counter_query_ns ? bcdev->cached_charge_counter : pst->prop[BATT_CHG_COUNTER];
+	battery_soc_refresh_counters(bcdev, pst, now, &charge_full,
+				     &charge_counter);
 
 	/* 3. Determine if charging or discharging */
 	if (!bcdev->boot_stabilized &&
@@ -2658,15 +2681,19 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 	 * the SOC_BOOT_GUARD_* comment. Cheap unless the value is suspect.
 	 */
 	target_soc = battery_soc_boot_guard(bcdev, pst, target_soc,
-					    charge_counter, is_charging,
-					    now, &guarded);
+					    charge_full, charge_counter,
+					    is_charging, now, &guarded);
 
 	/* 5. State machine under soc_lock */
 	spin_lock_irqsave(&bcdev->soc_lock, flags);
 
 	if (gauge_failsafe) {
 		bcdev->failsafe_recovering = true;
-	} else if (bcdev->failsafe_recovering) {
+	} else if (bcdev->failsafe_recovering && charge_full > 0 && !guarded &&
+		   !is_failsafe_100 && !is_failsafe_low && !is_failsafe_chg &&
+		   !(raw_soc < 0 &&
+		     (target_soc == 0 || target_soc >= 100 ||
+		      (is_charging && target_soc <= SOC_BOOT_SUSPECT_PCT)))) {
 		if (bcdev->boot_stabilized)
 			recovered = true;
 		bcdev->failsafe_recovering = false;
@@ -2835,9 +2862,16 @@ static int battery_soc_from_charge_counter(struct battery_chg_dev *bcdev,
 	/*
 	 * One-shot correction of a provisional boot latch: replace the
 	 * hold/OCV estimate with real telemetry in either direction as soon as
-	 * an unguarded measurement arrives.
+	 * an unguarded measurement arrives, but never overwrite it with a
+	 * fail-safe reading or an unseeded suspect low SOC on charger plug-in.
 	 */
 	if (bcdev->boot_provisional) {
+		if ((is_charging && raw_soc < 0 &&
+		     target_soc <= SOC_BOOT_SUSPECT_PCT) ||
+		    is_failsafe_100 || is_failsafe_low || is_failsafe_chg) {
+			spin_unlock_irqrestore(&bcdev->soc_lock, flags);
+			return bcdev->last_soc;
+		}
 		bcdev->last_soc = target_soc;
 		bcdev->last_change_ns = now;
 		bcdev->boot_provisional = false;
