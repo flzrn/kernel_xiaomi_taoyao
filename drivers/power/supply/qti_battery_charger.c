@@ -272,7 +272,7 @@ enum xm_property_id {
 	/* use for MI SMART INTERCHG */
 	XM_PROP_VDM_CMD_SINK_SOC,
 	/*****************/
-#if defined(CONFIG_MI_WIRELESS) || !defined(CONFIG_QTI_BATTERY_TAOYAO_STOCK)
+#if defined(CONFIG_MI_WIRELESS)
 	XM_PROP_WLS_BIN,
 #endif
 	XM_PROP_FASTCHGMODE,
@@ -468,8 +468,10 @@ struct battery_chg_dev {
 	u32				*thermal_levels;
 	const char			*wls_fw_name;
 	int				curr_thermal_level;
+	int				applied_thermal_level;
 	int				curr_wlsthermal_level;
 	int				num_thermal_levels;
+	int				num_dt_thermal_levels;
 	atomic_t			state;
 	struct work_struct		subsys_up_work;
 	struct work_struct		usb_type_work;
@@ -979,6 +981,7 @@ static void battery_chg_state_cb(void *priv, enum pmic_glink_state state)
 	if (state == PMIC_GLINK_STATE_UP) {
 		schedule_work(&bcdev->subsys_up_work);
 	} else if (state == PMIC_GLINK_STATE_DOWN) {
+		bcdev->applied_thermal_level = -EINVAL;
 		spin_lock_irqsave(&bcdev->ack_lock, flags);
 		if (bcdev->request_pending) {
 			bcdev->resp_ret = -ENOTCONN;
@@ -1870,40 +1873,10 @@ static struct power_supply_desc usb_psy_desc = {
 	.property_is_writeable	= usb_psy_prop_is_writeable,
 };
 
-static int __battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
-					u32 fcc_ua)
+static int battery_chg_apply_thermal_level(struct battery_chg_dev *bcdev,
+					   int val, bool force)
 {
-	/*
-	 * On the taoyao/SM7325 platform the ADSP uses BATT_CHG_CTRL_LIM as a
-	 * thermal-level index register, not a microamp register.  Writing a uA
-	 * value here is always rejected by the ADSP (non-zero ret_code), which
-	 * is now surfaced as an error through the resp_ret path introduced in
-	 * 045700ddf.  The actual hardware current ceiling is set by the
-	 * index-based battery_psy_set_charge_current() path that the thermal
-	 * framework drives; this function's role is purely software: it clamps
-	 * the effective FCC seen by that path and records last_fcc_ua.
-	 */
-	if (bcdev->restrict_chg_en) {
-		fcc_ua = min_t(u32, fcc_ua, bcdev->restrict_fcc_ua);
-		fcc_ua = min_t(u32, fcc_ua, bcdev->thermal_fcc_ua);
-	}
-
-	pr_debug("FCC gate: %u uA (restrict_chg_en=%d restrict_fcc_ua=%u)\n",
-		 fcc_ua, bcdev->restrict_chg_en, bcdev->restrict_fcc_ua);
-	bcdev->last_fcc_ua = fcc_ua;
-	return 0;
-}
-
-static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
-					int val)
-{
-	int rc;
-//	u32 fcc_ua, prev_fcc_ua;
-#ifndef CONFIG_QTI_BATTERY_TAOYAO_STOCK
-	if(val == bcdev->curr_thermal_level)
-	      return 0;
-#endif
-	pr_err("set thermal-level: %d num_thermal_levels: %d \n", val, bcdev->num_thermal_levels);
+	int rc, hw_val = val;
 
 	if (!bcdev->num_thermal_levels)
 		return 0;
@@ -1916,60 +1889,95 @@ static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 	if (val < 0 || val >= bcdev->num_thermal_levels)
 		return -EINVAL;
 
+#ifndef CONFIG_QTI_BATTERY_TAOYAO_STOCK
+	if (!force && val == bcdev->curr_thermal_level)
+		return 0;
+#endif
+	pr_err("set thermal-level: %d num_thermal_levels: %d \n",
+	       val, bcdev->num_thermal_levels);
+
 	/*
 	 * Honour the software FCC gate set by charging_enabled / restrict_chg /
-	 * restrict_cur sysfs nodes.  When restrict_chg_en is set (charging
-	 * disabled) block the index write; when restrict_fcc_ua caps the allowed
-	 * current, clamp the requested level to the nearest index whose current
-	 * does not exceed the cap.
+	 * restrict_cur sysfs nodes. When restrict_chg_en is set (charging
+	 * disabled) skip the BATT_CHG_CTRL_LIM index write and track the level;
+	 * when restrict_fcc_ua caps allowed current, clamp to the nearest DT
+	 * level that does not exceed the cap.
 	 */
 	if (bcdev->restrict_chg_en) {
 		if (!bcdev->restrict_fcc_ua) {
-			/* Charging explicitly disabled – skip the ADSP write. */
-			pr_debug("FCC gate: charging disabled, skipping level %d\n", val);
+			pr_debug("FCC gate: charging disabled, skipping level %d\n",
+				 val);
 			bcdev->curr_thermal_level = val;
+			bcdev->applied_thermal_level = -EINVAL;
 			return 0;
 		}
-		/* Clamp to the highest level whose current fits the cap. */
-		if (bcdev->thermal_levels && bcdev->thermal_levels[val] >
-		    bcdev->restrict_fcc_ua) {
-			int i;
+		if (bcdev->thermal_levels && bcdev->num_dt_thermal_levels > 0 &&
+		    hw_val < bcdev->num_dt_thermal_levels &&
+		    bcdev->thermal_levels[hw_val] > bcdev->restrict_fcc_ua) {
+			int i, clamped = bcdev->num_dt_thermal_levels - 1;
 
-			for (i = val + 1; i < bcdev->num_thermal_levels; i++) {
-				if (bcdev->thermal_levels[i] <=
-				    bcdev->restrict_fcc_ua) {
-					val = i;
+			for (i = hw_val + 1; i < bcdev->num_dt_thermal_levels; i++) {
+				if (bcdev->thermal_levels[i] <= bcdev->restrict_fcc_ua) {
+					clamped = i;
 					break;
 				}
 			}
+			hw_val = clamped;
 		}
 	}
 
+	if (force && hw_val == bcdev->applied_thermal_level) {
+		bcdev->curr_thermal_level = val;
+		return 0;
+	}
+
 	rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_BATTERY],
-				BATT_CHG_CTRL_LIM, val);
+				BATT_CHG_CTRL_LIM, hw_val);
 	if (rc < 0)
-		pr_err("Failed to set ccl:%d, rc=%d\n", val, rc);
+		pr_err("Failed to set ccl:%d, rc=%d\n", hw_val, rc);
 
 #ifdef CONFIG_QTI_BATTERY_TAOYAO_STOCK
-	if (!rc)
+	if (!rc) {
 		bcdev->curr_thermal_level = val;
+		bcdev->applied_thermal_level = hw_val;
+	}
 #else
 	bcdev->curr_thermal_level = val;
-#endif
-#if 0
-	fcc_ua = bcdev->thermal_levels[val];
-	prev_fcc_ua = bcdev->thermal_fcc_ua;
-	bcdev->thermal_fcc_ua = fcc_ua;
-
-	rc = __battery_psy_set_charge_current(bcdev, fcc_ua);
 	if (!rc)
-		bcdev->curr_thermal_level = val;
-	else
-		bcdev->thermal_fcc_ua = prev_fcc_ua;
-		bcdev->thermal_fcc_ua = fcc_ua;
-	}
+		bcdev->applied_thermal_level = hw_val;
 #endif
 	return rc;
+}
+
+static int __battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
+					u32 fcc_ua)
+{
+	/*
+	 * On the taoyao/SM7325 platform the ADSP uses BATT_CHG_CTRL_LIM as a
+	 * thermal-level index register, not a microamp register.  Record the
+	 * requested software cap in last_fcc_ua and push the clamped thermal
+	 * level index via battery_chg_apply_thermal_level().
+	 */
+	if (bcdev->restrict_chg_en) {
+		fcc_ua = min_t(u32, fcc_ua, bcdev->restrict_fcc_ua);
+		fcc_ua = min_t(u32, fcc_ua, bcdev->thermal_fcc_ua);
+	}
+
+	pr_debug("FCC gate: %u uA (restrict_chg_en=%d restrict_fcc_ua=%u)\n",
+		 fcc_ua, bcdev->restrict_chg_en, bcdev->restrict_fcc_ua);
+	bcdev->last_fcc_ua = fcc_ua;
+
+	if (!READ_ONCE(bcdev->initialized) || READ_ONCE(bcdev->removing))
+		return 0;
+
+	return battery_chg_apply_thermal_level(bcdev, bcdev->curr_thermal_level,
+					       true);
+}
+
+static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
+					int val)
+{
+	return battery_chg_apply_thermal_level(bcdev, val, false);
 }
 
 #define MIN_DISCHARGE_STEP_NS	(20 * NSEC_PER_SEC)
@@ -7002,6 +7010,7 @@ static int battery_chg_parse_dt(struct battery_chg_dev *bcdev)
 		fallback_fcc = pst->prop[BATT_CHG_CTRL_LIM_MAX];
 
 	bcdev->thermal_levels[0] = fallback_fcc;
+	bcdev->num_dt_thermal_levels = len + 1;
 	bcdev->num_thermal_levels = MAX_THERMAL_LEVEL;
 	bcdev->thermal_fcc_ua = fallback_fcc;
 
@@ -7140,6 +7149,7 @@ static int battery_chg_probe(struct platform_device *pdev)
 	bcdev->last_soc = -1;
 	bcdev->boot_highest_soc = -1;
 	bcdev->boot_counter_soc = -1;
+	bcdev->applied_thermal_level = -EINVAL;
 	init_completion(&bcdev->ack);
 	init_completion(&bcdev->fw_buf_ack);
 	init_completion(&bcdev->fw_update_ack);
@@ -7246,6 +7256,13 @@ static int battery_chg_probe(struct platform_device *pdev)
 	if (bcdev->use_charge_counter_soc_calib &&
 	    !bcdev->boot_stabilized && !delayed_work_pending(&bcdev->boot_soc_work))
 		schedule_delayed_work(&bcdev->boot_soc_work, msecs_to_jiffies(1000));
+
+#if !defined(CONFIG_MI_WIRELESS) && !defined(CONFIG_DUAL_FUEL_GAUGE) && defined(CONFIG_BQ2597X)
+	BUILD_BUG_ON(XM_PROP_FASTCHGMODE != 62);
+	BUILD_BUG_ON(XM_PROP_FB_BLANK_STATE != 73);
+	BUILD_BUG_ON(XM_PROP_THERMAL_TEMP != 74);
+	BUILD_BUG_ON(XM_PROP_FG1_RM != 79);
+#endif
 
 	dev_err(dev, "battery_chg_probe done\n");
 	return 0;
